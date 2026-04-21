@@ -3,7 +3,10 @@ info:
   title: NutriHelp API
   version: 1.0.0
 servers:
-- url: http://localhost/api
+- url: https://nutrihelp-backend-deployment.onrender.com/api
+  description: Production (Render)
+- url: http://localhost:3000/api
+  description: Local development
 tags:
 - name: System
   description: System and security monitoring endpoints
