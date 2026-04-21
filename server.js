@@ -95,6 +95,14 @@ const corsOrigin = (origin, callback) => {
   // Allow requests with no Origin header (mobile clients, curl, etc.)
   if (!origin) return callback(null, true);
 
+  // Allow the Render service's own URL (Swagger UI same-service requests)
+  if (
+    process.env.RENDER_EXTERNAL_URL &&
+    origin === process.env.RENDER_EXTERNAL_URL
+  ) {
+    return callback(null, true);
+  }
+
   // In development, also allow localhost origins
   if (process.env.NODE_ENV !== "production") {
     if (
