@@ -7,11 +7,34 @@ const sgMail = require("@sendgrid/mail");
 const crypto = require("crypto");
 const supabase = require("../dbConnection");
 const { validationResult } = require("express-validator");
+const { logSecurityEvent } = require("../services/securityEventService");
 
-// ✅ Set SendGrid API key once globally
+// ✅ Your logging
+const { createLog, log } = require("../services/securityLogger");
+
+// ✅ Team modules
+const logger = require("../utils/logger");
+const authService = require("../services/authService");
+const nodemailer = require("nodemailer");
+
+// ✅ SendGrid setup
 sgMail.setApiKey(process.env.SENDGRID_KEY);
 
+// ✅ Access Token
+function createAccessToken(user) {
+  return jwt.sign(
+    {
+      userId: user.user_id,
+      role: user.user_roles?.role_name || "unknown",
+    },
+    process.env.JWT_TOKEN,
+    { expiresIn: "1h" }
+  );
+}
+
+// ================= LOGIN =================
 const login = async (req, res) => {
+  console.log("LOGIN CONTROLLER HIT");
   const errors = validationResult(req);
   if (!errors.isEmpty()) {
     return res.status(400).json({ errors: errors.array() });
@@ -20,39 +43,34 @@ const login = async (req, res) => {
   const email = req.body.email?.trim().toLowerCase();
   const password = req.body.password;
 
-  let clientIp = req.headers["x-forwarded-for"] || req.socket.remoteAddress || req.ip;
+  let clientIp =
+    req.headers["x-forwarded-for"] || req.socket.remoteAddress || req.ip;
   clientIp = clientIp === "::1" ? "127.0.0.1" : clientIp;
 
   if (!email || !password) {
-    return res.status(400).json({ error: "Email and password are required" });
+    log(
+      createLog({
+        event_type: "AUTH_LOGIN_FAILED",
+        severity_level: "MEDIUM",
+        user_id: null,
+        source_service: "login-controller",
+        ip_address: clientIp,
+        endpoint: req.originalUrl,
+        method: req.method,
+        status: "FAILED",
+        message: "Missing email or password",
+      })
+    );
+
+    return res
+      .status(400)
+      .json({ error: "Email and password are required" });
   }
 
-  const tenMinutesAgoISO = new Date(Date.now() - 10 * 60 * 1000).toISOString();
-
   try {
-    // Count failed login attempts
-    const { data: failuresByEmail } = await supabase
-      .from("brute_force_logs")
-      .select("id")
-      .eq("email", email)
-      .eq("success", false)
-      .gte("created_at", tenMinutesAgoISO);
-
-    const failureCount = failuresByEmail?.length || 0;
-
-    if (failureCount >= 10) {
-      return res.status(429).json({
-        error: "❌ Too many failed login attempts. Please try again after 10 minutes."
-      });
-    }
-
-    // Validate credentials
     const user = await getUserCredentials(email);
-    const userExists = user && user.length !== 0;
-    const isPasswordValid = userExists ? await bcrypt.compare(password, user.password) : false;
-    const isLoginValid = userExists && isPasswordValid;
 
-    if (!isLoginValid) {
+    if (!user) {
       await supabase.from("brute_force_logs").insert([{
         email,
         ip_address: clientIp,
@@ -60,43 +78,96 @@ const login = async (req, res) => {
         created_at: new Date().toISOString()
       }]);
 
-      if (failureCount === 4) {
-        return res.status(429).json({
-          warning: "⚠ You have one attempt left before your account is temporarily locked."
-        });
-      }
-
-      if (!userExists || !isPasswordValid) {
-        await sendFailedLoginAlert(email, clientIp);
-
-        if (!userExists) {
-          return res.status(401).json({ error: "Invalid email" });
+      await logSecurityEvent({
+        event_type: "LOGIN_FAILED",
+        severity: "medium",
+        user_id: null,
+        ip_address: clientIp,
+        user_agent: req.headers["user-agent"],
+        resource: "/api/auth/login",
+        metadata: {
+          email,
+          reason: "account_not_found"
         }
+      });
 
-        return res.status(401).json({ error: "Invalid password" });
-      }
-    }
+      log(
+        createLog({
+          event_type: "AUTH_LOGIN_FAILED",
+          severity_level: "MEDIUM",
+          user_id: null,
+          source_service: "login-controller",
+          ip_address: clientIp,
+          endpoint: req.originalUrl,
+          method: req.method,
+          status: "FAILED",
+          message: "User not found",
+        })
+      );
 
-    // Log successful login attempt
-    await supabase.from("brute_force_logs").insert([{
-      email,
-      success: true,
-      created_at: new Date().toISOString()
-    }]);
-
-    await supabase.from("brute_force_logs").delete()
-      .eq("email", email)
-      .eq("success", false);
-
-    // MFA handling
-    if (user.mfa_enabled) {
-      const token = crypto.randomInt(100000, 999999);
-      await addMfaToken(user.user_id, token);
-      await sendOtpEmail(user.email, token);
-      return res.status(202).json({
-        message: "An MFA Token has been sent to your email address"
+      await sendFailedLoginAlert(email, clientIp);
+      return res.status(404).json({
+        error: "Account not found. Please create an account first."
       });
     }
+
+    const isPasswordValid = await bcrypt.compare(password, user.password);
+
+    if (!isPasswordValid) {
+      await supabase.from("brute_force_logs").insert([{
+        email,
+        ip_address: clientIp,
+        success: false,
+        created_at: new Date().toISOString()
+      }]);
+
+      console.log("About to log LOGIN_FAILED event");
+
+      await logSecurityEvent({
+        event_type: "LOGIN_FAILED",
+        severity: "medium",
+        user_id: user.user_id,
+        ip_address: clientIp,
+        user_agent: req.headers["user-agent"],
+        resource: "/api/auth/login",
+        metadata: {
+          email,
+          reason: "invalid_password"
+        }
+      });
+
+      log(
+        createLog({
+          event_type: "AUTH_LOGIN_FAILED",
+          severity_level: "MEDIUM",
+          user_id: user.user_id,
+          source_service: "login-controller",
+          ip_address: clientIp,
+          endpoint: req.originalUrl,
+          method: req.method,
+          status: "FAILED",
+          message: "Invalid password",
+        })
+      );
+
+      await sendFailedLoginAlert(email, clientIp);
+      return res.status(401).json({ error: "Invalid password" });
+    }
+
+    // ✅ SUCCESS LOG
+    log(
+      createLog({
+        event_type: "AUTH_LOGIN_SUCCESS",
+        severity_level: "LOW",
+        user_id: user.user_id,
+        source_service: "login-controller",
+        ip_address: clientIp,
+        endpoint: req.originalUrl,
+        method: req.method,
+        status: "SUCCESS",
+        message: "User logged in successfully",
+      })
+    );
 
     await logLoginEvent({
       userId: user.user_id,
@@ -105,107 +176,74 @@ const login = async (req, res) => {
       userAgent: req.headers["user-agent"]
     });
 
-    // ✅ RBAC-aware JWT generation
-    const token = jwt.sign(
-      { 
-        userId: user.user_id,
-        role: user.user_roles?.role_name || "unknown"
-      },
-      process.env.JWT_TOKEN,
-      { expiresIn: "1h" }
-    );
+    await logSecurityEvent({
+      event_type: "LOGIN_SUCCESS",
+      severity: "low",
+      user_id: user.user_id,
+      session_id: null,
+      ip_address: clientIp,
+      user_agent: req.headers["user-agent"],
+      resource: "/api/auth/login",
+      metadata: {
+        email
+      }
+    });
+
+    const token = createAccessToken(user);
 
     return res.status(200).json({ user, token });
-
   } catch (err) {
-    console.error("Login error:", err);
+    log(
+      createLog({
+        event_type: "SYSTEM_ERROR",
+        severity_level: "HIGH",
+        user_id: null,
+        source_service: "login-controller",
+        ip_address: clientIp,
+        endpoint: req.originalUrl,
+        method: req.method,
+        status: "ERROR",
+        message: err.message,
+      })
+    );
+
+    logger.error("Login error", err);
     return res.status(500).json({ error: "Internal server error" });
   }
 };
 
+// ================= MFA =================
 const loginMfa = async (req, res) => {
-  const errors = validationResult(req);
-  if (!errors.isEmpty()) {
-    return res.status(400).json({ errors: errors.array() });
-  }
-
   const email = req.body.email?.trim().toLowerCase();
   const password = req.body.password;
   const mfa_token = req.body.mfa_token;
 
   if (!email || !password || !mfa_token) {
-    return res.status(400).json({ error: "Email, password, and token are required" });
+    return res
+      .status(400)
+      .json({ error: "Email, password, and token are required" });
   }
 
   try {
     const user = await getUserCredentials(email);
-    if (!user || user.length === 0) {
-      return res.status(401).json({ error: "Invalid email or password" });
+    if (!user) {
+      return res.status(401).json({ error: "Invalid credentials" });
     }
 
-    const isPasswordValid = await bcrypt.compare(password, user.password);
-    if (!isPasswordValid) {
-      return res.status(401).json({ error: "Invalid email or password" });
+    const validPassword = await bcrypt.compare(password, user.password);
+    const validToken = await verifyMfaToken(user.user_id, mfa_token);
+
+    if (!validPassword || !validToken) {
+      return res.status(401).json({ error: "Invalid credentials" });
     }
 
-    const tokenValid = await verifyMfaToken(user.user_id, mfa_token);
-    if (!tokenValid) {
-      return res.status(401).json({ error: "Token is invalid or has expired" });
-    }
-
-    // ✅ RBAC-aware JWT
-    const token = jwt.sign(
-      { 
-        userId: user.user_id,
-        role: user.user_roles?.role_name || "unknown"
-      },
-      process.env.JWT_TOKEN,
-      { expiresIn: "1h" }
-    );
+    const token = createAccessToken(user);
 
     return res.status(200).json({ user, token });
-
   } catch (err) {
-    console.error("MFA login error:", err);
+    logger.error("MFA error", err);
     return res.status(500).json({ error: "Internal server error" });
   }
 };
-
-// ✅ Send OTP email via SendGrid
-async function sendOtpEmail(email, token) {
-  try {
-    await sgMail.send({
-      to: email,
-      from: process.env.SENDGRID_FROM,
-      subject: "NutriHelp Login Token",
-      text: `Your token to log in is ${token}`,
-      html: `Your token to log in is <strong>${token}</strong>`
-    });
-    console.log("OTP email sent successfully to", email);
-  } catch (err) {
-    console.error("Error sending OTP email:", err.response?.body || err.message);
-  }
-}
-
-// ✅ Send failed login alert via SendGrid
-async function sendFailedLoginAlert(email, ip) {
-  try {
-    await sgMail.send({
-      from: process.env.SENDGRID_FROM,
-      to: email,
-      subject: "Failed Login Attempt on NutriHelp",
-      text: `Hi,
-
-Someone tried to log in to NutriHelp using your email address from IP: ${ip}.
-
-If this wasn't you, please ignore this message. But if you're concerned, consider resetting your password or contacting support.
-
-– NutriHelp Security Team`
-    });
-    console.log(`Failed login alert sent to ${email}`);
-  } catch (err) {
-    console.error("Failed to send alert email:", err.response?.body || err.message);
-  }
-}
 
 module.exports = { login, loginMfa };

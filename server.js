@@ -1,64 +1,72 @@
-// server.js
 require("dotenv").config();
 
+// Structured Logging - NEW
+const logger = require('./utils/logger');
+const { requestLoggingMiddleware } = require('./middleware/requestLogger');
+const { sessionMonitorMiddleware } = require('./middleware/sessionMonitor');
+const { structuredErrorHandler } = require('./middleware/structuredErrorHandler');
+
+//Logging & Metrics
+const {
+  metricsMiddleware,
+  metricsEndpoint,
+} = require("./Monitor_&_Logging/metrics");
+
+// Debug environment variables
+console.log("🔧 Environment Variables Check:");
+console.log(
+  "   SUPABASE_URL:",
+  process.env.SUPABASE_URL ? "✓ Set" : "✗ Missing",
+);
+console.log(
+  "   SUPABASE_ANON_KEY:",
+  process.env.SUPABASE_ANON_KEY ? "✓ Set" : "✗ Missing",
+);
+console.log("   PORT:", process.env.PORT || "3000 (default)");
+console.log("");
+
 const express = require("express");
+const { errorLogger, responseTimeLogger } = require("./middleware/errorLogger");
+
 const helmet = require("helmet");
 const cors = require("cors");
 const swaggerUi = require("swagger-ui-express");
 const yaml = require("yamljs");
 const rateLimit = require("express-rate-limit");
+const uploadRoutes = require("./routes/uploadRoutes");
 const fs = require("fs");
 const path = require("path");
-
-// routes
-const uploadRoutes = require("./routes/uploadRoutes");
 const systemRoutes = require("./routes/systemRoutes");
-const routes = require("./routes");             // your main router index (mount under /api inside)
-const signupRoute = require("./routes/signup"); // signup router
+const loginDashboard = require("./routes/loginDashboard.js");
+const securityEventsRoutes = require("./routes/securityEvents");
 
-// ----- directories (ensure uploads and temp exist) -----
+// WARNING: Render has an ephemeral filesystem.
+// Files saved to uploads/ will be deleted on every deploy or restart.
+// TODO: Migrate file uploads to Supabase Storage for persistent storage.
+
+// Ensure uploads directory exists
 const uploadsDir = path.join(__dirname, "uploads");
 if (!fs.existsSync(uploadsDir)) {
-  try {
-    fs.mkdirSync(uploadsDir, { recursive: true });
-    console.log("Created uploads directory");
-  } catch (err) {
-    console.error("Error creating uploads directory:", err);
-  }
+  fs.mkdirSync(uploadsDir, { recursive: true });
+  console.log("Created uploads directory");
 }
 
-const tempDir = path.join(uploadsDir, "temp");
+// Create temp directory for uploads
+const tempDir = path.join(__dirname, "uploads", "temp");
 if (!fs.existsSync(tempDir)) {
-  try {
-    fs.mkdirSync(tempDir, { recursive: true });
-    console.log("Created temp uploads directory");
-  } catch (err) {
-    console.error("Error creating temp uploads directory:", err);
-  }
+  fs.mkdirSync(tempDir, { recursive: true });
+  console.log("Created temp uploads directory");
 }
 
-// ----- temp file cleanup -----
+// Cleanup temp files
 function cleanupOldFiles() {
   const now = Date.now();
   const ONE_DAY = 24 * 60 * 60 * 1000;
-
   try {
-    const tempFiles = fs.readdirSync(tempDir);
-    let deletedCount = 0;
-    tempFiles.forEach((file) => {
+    for (const file of fs.readdirSync(tempDir)) {
       const filePath = path.join(tempDir, file);
-      try {
-        const stats = fs.statSync(filePath);
-        if (now - stats.mtimeMs > ONE_DAY) {
-          fs.unlinkSync(filePath);
-          deletedCount++;
-        }
-      } catch (err) {
-        console.error(`Error checking file ${filePath}:`, err);
-      }
-    });
-    if (deletedCount > 0) {
-      console.log(`Cleaned up ${deletedCount} old temporary files`);
+      const stats = fs.statSync(filePath);
+      if (now - stats.mtimeMs > ONE_DAY) fs.unlinkSync(filePath);
     }
   } catch (err) {
     console.error("Error during file cleanup:", err);
@@ -67,148 +75,170 @@ function cleanupOldFiles() {
 cleanupOldFiles();
 setInterval(cleanupOldFiles, 3 * 60 * 60 * 1000);
 
-// ----- app -----
+// ✅ Create the app BEFORE using it
 const app = express();
+const port = process.env.PORT || 3000;
+
+// DB
+let db = require("./dbConnection");
+
+// ⚠️ CRITICAL: Add request logging middleware FIRST, before any routes
+app.use(requestLoggingMiddleware);
+app.use(sessionMonitorMiddleware);
+
+// Dynamic CORS origin: reads allowed origins from ALLOWED_ORIGINS env var
+const allowedOriginsEnv = process.env.ALLOWED_ORIGINS
+  ? process.env.ALLOWED_ORIGINS.split(",").map((o) => o.trim())
+  : [];
+
+const corsOrigin = (origin, callback) => {
+  // Allow requests with no Origin header (mobile clients, curl, etc.)
+  if (!origin) return callback(null, true);
+
+  // In development, also allow localhost origins
+  if (process.env.NODE_ENV !== "production") {
+    if (
+      origin.startsWith("http://localhost") ||
+      origin.startsWith("http://127.0.0.1")
+    ) {
+      return callback(null, true);
+    }
+  }
+
+  // Allow origins from ALLOWED_ORIGINS env var
+  if (allowedOriginsEnv.includes(origin)) {
+    return callback(null, true);
+  }
+
+  // Allow legacy non-production tool origins
+  if (
+    origin.startsWith("chrome-extension://eggdlmopfankeonchoflhfoglaakobma") ||
+    origin.startsWith("https://apifox.cn-hangzhou.log.aliyuncs.com")
+  ) {
+    return callback(null, true);
+  }
+
+  callback(new Error(`CORS blocked: ${origin}`));
+};
+
+// CORS
+app.use(cors({ origin: corsOrigin, credentials: true }));
+app.options("*", cors({ origin: corsOrigin, credentials: true }));
+app.use((req, res, next) => {
+  res.header("Access-Control-Allow-Credentials", "true");
+  next();
+});
 app.set("trust proxy", 1);
 
-// ----- env and port -----
-const PORT = process.env.PORT || 10000;
-
-// You can set a comma-separated list in FRONTEND_ORIGINS to allow specific sites
-// Example: FRONTEND_ORIGINS="https://nutrihelpfrontend.vercel.app,https://yourdomain.com"
-const EXTRA_ORIGINS = (process.env.FRONTEND_ORIGINS || "")
-  .split(",")
-  .map((s) => s.trim())
-  .filter(Boolean);
-
-// Local dev defaults
-const ALLOWED_ORIGINS = new Set([
-  "http://localhost:3000",
-  "http://localhost:5173",
-  ...EXTRA_ORIGINS,
-]);
-
-// Allow any preview on vercel.app (project-name-randomhash.vercel.app)
-const allowVercelPreview = (origin) =>
-  /^https:\/\/[a-z0-9-]+\.vercel\.app$/i.test(origin || "");
-
-// ----- CORS -----
-app.use(
-  cors({
-    origin: (origin, cb) => {
-      // allow server-to-server or curl with no Origin
-      if (!origin) return cb(null, true);
-      if (ALLOWED_ORIGINS.has(origin) || allowVercelPreview(origin)) {
-        return cb(null, true);
-      }
-      return cb(new Error(`CORS blocked for origin: ${origin}`));
-    },
-    methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
-    allowedHeaders: ["Content-Type", "Authorization"],
-    credentials: true,
-  })
-);
-app.options("*", cors());
-
-// ----- security headers (Helmet CSP) -----
-const apiOrigin =
-  process.env.RENDER_EXTERNAL_URL || "https://nutrihelp-backend-deployment.onrender.com";
-
+// Security
 app.use(
   helmet({
     contentSecurityPolicy: {
       directives: {
         defaultSrc: ["'self'"],
-        scriptSrc: [
-          "'self'",
-          "'unsafe-inline'",
-          "https://cdn.jsdelivr.net",
-          "https://cdnjs.cloudflare.com",
-        ],
-        styleSrc: [
-          "'self'",
-          "'unsafe-inline'",
-          "https://fonts.googleapis.com",
-          "https://cdn.jsdelivr.net",
-          "https://cdnjs.cloudflare.com",
-        ],
-        fontSrc: ["'self'", "https://fonts.gstatic.com", "data:"],
-        imgSrc: ["'self'", "data:", "blob:"],
-        connectSrc: ["'self'", apiOrigin, "https://*.vercel.app"],
+        scriptSrc: ["'self'", "'unsafe-inline'", "https://cdn.jsdelivr.net"],
+        styleSrc: ["'self'", "'unsafe-inline'", "https://cdn.jsdelivr.net"],
         objectSrc: ["'none'"],
       },
     },
     crossOriginEmbedderPolicy: true,
     referrerPolicy: { policy: "strict-origin-when-cross-origin" },
-  })
+  }),
 );
 
-// ----- rate limiter -----
+// Rate Limiter
 const limiter = rateLimit({
   windowMs: 15 * 60 * 1000,
   max: 1000,
   standardHeaders: true,
   legacyHeaders: false,
-  message: {
-    status: 429,
-    error: "Too many requests, please try again later.",
-  },
+  message: { status: 429, error: "Too many requests, please try again later." },
 });
 app.use(limiter);
 
-// ----- body parsers -----
+// Swagger
+const swaggerDocument = yaml.load("./index.yaml");
+app.use("/api-docs", swaggerUi.serve, swaggerUi.setup(swaggerDocument));
+// Response time monitoring
+app.use(responseTimeLogger);
+// JSON & URL parser
 app.use(express.json({ limit: "50mb" }));
 app.use(express.urlencoded({ limit: "50mb", extended: true }));
 
-// ----- health endpoints -----
+//Logging & Metrics routes
+app.use(metricsMiddleware);
+app.get("/api/metrics", metricsEndpoint);
+app.get("/api", (req, res) => {
+  res.json({
+    status: "ok",
+    message: "NutriHelp API is running",
+    uptime: process.uptime(),
+    metrics: "/api/metrics",
+    docs: "/api-docs"
+  });
+});
+app.get("/", (req, res) => {
+  res.redirect("/api");
+});
+
+// Health check endpoint for Render deployment
 app.get("/health", (req, res) => {
   res.status(200).json({
-    ok: true,
-    ts: Date.now(),
-    env: process.env.NODE_ENV || "production",
-  });
-});
-app.get("/api/health", (req, res) => {
-  res.status(200).json({
-    ok: true,
-    ts: Date.now(),
-    env: process.env.NODE_ENV || "production",
+    status: "ok",
+    timestamp: new Date().toISOString(),
+    uptime: process.uptime()
   });
 });
 
-// ----- swagger -----
-const swaggerDocument = yaml.load(path.join(__dirname, "index.yaml"));
-app.use("/api-docs", swaggerUi.serve, swaggerUi.setup(swaggerDocument));
-
-// ----- routes (mount under /api) -----
+// System routes (early in chain)
 app.use("/api/system", systemRoutes);
-routes(app);                 // ensure everything this mounts is using /api/... inside routes/index.js
-app.use("/api", uploadRoutes);
-app.use("/api/signup", signupRoute);
 
-// static files
+// Main routes registrar
+const routes = require("./routes");
+routes(app);
+
+// File uploads & static
+app.use("/api", uploadRoutes);
 app.use("/uploads", express.static("uploads"));
 
-// ----- error handlers -----
-app.use((err, req, res, next) => {
-  if (err) {
-    const msg = err.message || "Bad request";
-    return res.status(400).json({ error: msg });
-  }
-  next();
-});
+// Signup
+app.use("/api/signup", require("./routes/signup"));
+app.use("/security", securityEventsRoutes);
 
-app.use((err, req, res, next) => {
-  console.error("Unhandled error:", err);
-  res.status(500).json({ error: "Internal server error" });
-});
+// SMS
+app.use("/api/sms", require("./routes/sms"));
 
-// ----- start -----
-app.listen(PORT, () => {
-  const base = process.env.RENDER_EXTERNAL_URL || `http://localhost:${PORT}`;
+// Error handler
+app.use(errorLogger);
+
+// Structured error handling middleware (MUST be last)
+app.use(structuredErrorHandler);
+
+// Global error handler
+const {
+  uncaughtExceptionHandler,
+  unhandledRejectionHandler,
+} = require("./middleware/errorLogger");
+process.on("uncaughtException", uncaughtExceptionHandler);
+process.on("unhandledRejection", unhandledRejectionHandler);
+
+// Start
+app.listen(port, async () => {
   console.log("\n🎉 NutriHelp API launched successfully!");
-  console.log("==================================================");
-  console.log(`Server is running on port ${PORT}`);
-  console.log(`📚 Swagger UI: ${base}/api-docs`);
-  console.log("==================================================\n");
+  console.log("=".repeat(50));
+  console.log(`Server is running on port ${port}`);
+  console.log(`📚 Swagger UI: http://localhost:${port}/api-docs`);
+  console.log("=".repeat(50));
+  console.log("💡 Press Ctrl+C to stop the server \n");
 });
+
+const SELF_URL = process.env.RENDER_EXTERNAL_URL || `http://localhost:${port}`;
+
+setInterval(async () => {
+  try {
+    const response = await fetch(`${SELF_URL}/health`);
+    console.log(`[Keep-Alive] Pinged /health — status: ${response.status}`);
+  } catch (err) {
+    console.error(`[Keep-Alive] Ping failed:`, err.message);
+  }
+}, 14 * 60 * 1000);
