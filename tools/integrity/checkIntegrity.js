@@ -1,9 +1,8 @@
-const fs = require("fs-extra");
+const fs = require("fs");
 const crypto = require("crypto");
-//To install use this command npm install crypto fs-extra
 const path = require("path");
  
-const baseline = fs.readJSONSync("tools/integrity/baseline.json");
+const baseline = JSON.parse(fs.readFileSync("tools/integrity/baseline.json", "utf8"));
  
 function hashFile(filePath) {
   const fileBuffer = fs.readFileSync(filePath);

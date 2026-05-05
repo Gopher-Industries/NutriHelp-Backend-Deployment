@@ -1,5 +1,4 @@
 const supabase = require("../dbConnection.js");
-const { decode } = require("base64-arraybuffer");
 
 async function createRecipe(
   user_id,
@@ -109,7 +108,7 @@ async function saveImage(image, recipe_id) {
   try {
     await supabase.storage
       .from("images")
-      .upload(file_name, decode(image), {
+      .upload(file_name, Buffer.from(image.split(",")[1] || image, "base64"), {
         cacheControl: "3600",
         upsert: false,
       });

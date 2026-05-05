@@ -1,4 +1,4 @@
-const fs = require("fs-extra");
+const fs = require("fs");
 const crypto = require("crypto");
 const path = require("path");
  
@@ -16,7 +16,7 @@ function hashFile(filePath) {
 }
  
 function checkFileIntegrity() {
-  const baseline = fs.readJSONSync("tools/integrity/baseline.json");
+  const baseline = JSON.parse(fs.readFileSync("tools/integrity/baseline.json", "utf8"));
   let anomalies = [];
  
   for (const file in baseline) {
@@ -61,7 +61,7 @@ function generateBaseline() {
     };
   });
  
-  fs.writeJSONSync("tools/integrity/baseline.json", baseline, { spaces: 2 });
+  fs.writeFileSync("tools/integrity/baseline.json", JSON.stringify(baseline, null, 2));
  
   return { message: "Baseline regenerated successfully", fileCount: filesToMonitor.length };
 }

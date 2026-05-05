@@ -32,18 +32,14 @@ const systemRoutes = require('./routes/systemRoutes');
 const { metricsMiddleware, metricsEndpoint } = require('./Monitor_&_Logging/metrics');
 const { runAlertCheckJob } = require('./services/securityAlertService');
 
-const FRONTEND_ORIGIN = 'http://localhost:3000';
-
 console.log('🔧 Environment Variables Check:');
 console.log('   SUPABASE_URL:', process.env.SUPABASE_URL ? '✓ Set' : '✗ Missing');
 console.log('   SUPABASE_ANON_KEY:', process.env.SUPABASE_ANON_KEY ? '✓ Set' : '✗ Missing');
-console.log('   HTTPS_PORT:', process.env.HTTPS_PORT || '443 (default)');
-console.log('   HTTP_PORT:', process.env.HTTP_PORT || process.env.PORT || '80 (default)');
+console.log('   PORT:', process.env.PORT || '3000 (default)');
 console.log('');
 
 const app = express();
-const HTTPS_PORT = Number(process.env.HTTPS_PORT) || 443;
-const HTTP_PORT = Number(process.env.HTTP_PORT || process.env.PORT) || 80;
+const PORT = Number(process.env.PORT) || 3000;
 const tlsKeyPath = process.env.TLS_KEY_PATH || path.join(__dirname, 'certs', 'local-key.pem');
 const tlsCertPath = process.env.TLS_CERT_PATH || path.join(__dirname, 'certs', 'local-cert.pem');
 
@@ -86,23 +82,46 @@ app.use(sessionMonitorMiddleware);
 app.use(localeMiddleware);
 app.use(responseContractMiddleware);
 
-app.use(cors({
-  origin: (origin, callback) => {
-    if (!origin) return callback(null, true);
-    if (
-      origin.startsWith('http://localhost') ||
-      origin.startsWith('http://127.0.0.1') ||
-      origin.startsWith('chrome-extension://eggdlmopfankeonchoflhfoglaakobma') ||
-      origin.startsWith('https://apifox.cn-hangzhou.log.aliyuncs.com')
-    ) {
-      callback(null, true);
-    } else {
-      callback(new Error(`CORS blocked: ${origin}`));
-    }
-  },
-  credentials: true,
-}));
-app.options('*', cors({ origin: FRONTEND_ORIGIN, credentials: true }));
+// Allowed origins: comma-separated list in ALLOWED_ORIGINS env var
+// e.g. ALLOWED_ORIGINS=https://nutrihelp.vercel.app,https://custom-domain.com
+const allowedOriginsEnv = process.env.ALLOWED_ORIGINS
+  ? process.env.ALLOWED_ORIGINS.split(',').map(o => o.trim()).filter(Boolean)
+  : [];
+
+const corsOrigin = (origin, callback) => {
+  if (!origin) return callback(null, true);
+
+  // Allow Render's own service URL (Swagger UI same-service requests)
+  if (process.env.RENDER_EXTERNAL_URL && origin === process.env.RENDER_EXTERNAL_URL) {
+    return callback(null, true);
+  }
+
+  // Allow localhost / 127.0.0.1 on any port (covers Expo Web :19006, Metro :8081, etc.)
+  if (origin.startsWith('http://localhost') || origin.startsWith('http://127.0.0.1')) {
+    return callback(null, true);
+  }
+
+  // Allow Expo Go LAN dev client (http://<local-ip>:8081 and :19000)
+  if (/^http:\/\/192\.168\.\d+\.\d+:(8081|19000|19006)$/.test(origin) ||
+      /^http:\/\/10\.\d+\.\d+\.\d+:(8081|19000|19006)$/.test(origin)) {
+    return callback(null, true);
+  }
+
+  // Allow any *.vercel.app preview deploy (for web builds)
+  if (/^https:\/\/[a-z0-9-]+\.vercel\.app$/i.test(origin)) {
+    return callback(null, true);
+  }
+
+  // Allow explicit origins from env var
+  if (allowedOriginsEnv.includes(origin)) {
+    return callback(null, true);
+  }
+
+  callback(new Error(`CORS blocked: ${origin}`));
+};
+
+app.use(cors({ origin: corsOrigin, credentials: true, methods: ['GET','POST','PUT','PATCH','DELETE','OPTIONS'], allowedHeaders: ['Content-Type','Authorization'] }));
+app.options('*', cors({ origin: corsOrigin, credentials: true }));
 app.use((req, res, next) => {
   res.header('Access-Control-Allow-Credentials', 'true');
   next();
@@ -201,75 +220,39 @@ function gracefulShutdown(signal) {
     alertIntervalId = null;
     console.log('[server] CT-004 Alert checking job stopped');
   }
-  httpsServer.close(() => process.exit(0));
+  server.close(() => process.exit(0));
   setTimeout(() => process.exit(1), 10000).unref();
 }
 process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
 process.on('SIGINT', () => gracefulShutdown('SIGINT'));
 
-function createHttpsServer() {
-  try {
-    const tlsOptions = {
-      key: fs.readFileSync(tlsKeyPath),
-      cert: fs.readFileSync(tlsCertPath),
-      minVersion: 'TLSv1.3',
-      maxVersion: 'TLSv1.3',
-    };
-    return https.createServer(tlsOptions, app);
-  } catch (error) {
-    if (process.env.NODE_ENV === 'production') {
-      console.error('Failed to start HTTPS server with TLS 1.3 enforcement.');
-      process.exit(1);
-    }
-    console.warn('⚠️  TLS certs not found — falling back to HTTP for local development.');
-    return null;
-  }
+// On Render, TLS is terminated at the proxy — app listens on plain HTTP.
+// For local dev, use HTTPS if self-signed certs exist; otherwise fall back to HTTP.
+let server;
+if (!process.env.RENDER && fs.existsSync(tlsKeyPath) && fs.existsSync(tlsCertPath)) {
+  const tlsOptions = {
+    key: fs.readFileSync(tlsKeyPath),
+    cert: fs.readFileSync(tlsCertPath),
+    minVersion: 'TLSv1.3',
+  };
+  server = https.createServer(tlsOptions, app);
+  console.log('🔒 Using HTTPS (local TLS certs found)');
+} else {
+  server = http.createServer(app);
+  console.log(process.env.RENDER
+    ? '🌐 Using HTTP (Render handles TLS at proxy)'
+    : '🔓 Using HTTP (no local TLS certs found)');
 }
 
-function createRedirectServer() {
-  return http.createServer((req, res) => {
-    const host = (req.headers.host || 'localhost').replace(/:\d+$/, `:${HTTPS_PORT}`);
-    const redirectUrl = `https://${host}${req.url || '/'}`;
-    res.writeHead(301, { Location: redirectUrl });
-    res.end();
-  });
-}
-
-const httpsServer = createHttpsServer();
-const useHttpFallback = httpsServer === null;
-const activePort = useHttpFallback ? HTTP_PORT : HTTPS_PORT;
-const activeServer = useHttpFallback ? http.createServer(app) : httpsServer;
-
-if (!useHttpFallback) {
-  const redirectServer = createRedirectServer();
-  redirectServer.on('error', (err) => {
-    if (err.code === 'EACCES' || err.code === 'EADDRINUSE') {
-      console.warn(`⚠️ HTTP redirect server could not start on port ${HTTP_PORT} (${err.code}).`);
-      return;
-    }
-    throw err;
-  });
-  redirectServer.listen(HTTP_PORT);
-}
-
-activeServer.listen(activePort, async () => {
+server.listen(PORT, async () => {
   console.log('\n🎉 NutriHelp API launched successfully!');
   console.log('='.repeat(50));
-  const proto = useHttpFallback ? 'http' : 'https';
-  if (useHttpFallback) {
-    console.log(`🔓 HTTP server running on port ${activePort} (dev mode — no TLS)`);
-    console.log(`📚 Swagger UI: http://localhost:${activePort}/api-docs`);
-  } else {
-    console.log(`🔒 HTTPS server running on port ${activePort} (TLS 1.3 only)`);
-    console.log(`🔁 HTTP redirect server running on port ${HTTP_PORT}`);
-    console.log(`📚 Swagger UI: https://localhost:${activePort}/api-docs`);
-  }
+  console.log(`Server is running on port ${PORT}`);
+  console.log(`📚 Swagger UI: http://localhost:${PORT}/api-docs`);
   console.log('='.repeat(50));
   console.log('💡 Press Ctrl+C to stop the server \n');
 
   // CT-004: Start alert job only after the server is fully bound and ready.
-  // The interval callback is wrapped so a single failing run never stops
-  // future runs (runAlertCheckJob already has an internal try/catch).
   try {
     await runAlertCheckJob();
     alertIntervalId = setInterval(async () => {
@@ -284,8 +267,8 @@ activeServer.listen(activePort, async () => {
     console.warn('[server] Failed to run initial alert check:', err.message);
   }
 
-  if (process.platform === 'win32') {
-    exec(`start https://localhost:${HTTPS_PORT}/api-docs`);
+  if (process.platform === 'win32' && !process.env.RENDER) {
+    exec(`start http://localhost:${PORT}/api-docs`);
   }
 });
 

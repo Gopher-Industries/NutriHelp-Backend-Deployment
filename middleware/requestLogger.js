@@ -1,10 +1,10 @@
 const logger = require('../utils/logger');
 const { recordRequest } = require('../services/requestAuditService');
-const { v4: uuidv4 } = require('uuid');
+const { randomUUID } = require('crypto');
 
 module.exports = (req, res, next) => {
   const startTime = Date.now();
-  const requestId = uuidv4();
+  const requestId = randomUUID();
   const method = req.method;
   const path = req.originalUrl;
 

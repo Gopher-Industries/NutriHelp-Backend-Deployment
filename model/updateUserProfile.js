@@ -1,5 +1,4 @@
 const supabase = require("../dbConnection.js");
-const { decode } = require("base64-arraybuffer");
 const { encrypt, decrypt } = require("../services/encryptionService");
 
 async function decryptSensitiveFields(profile) {
@@ -183,7 +182,7 @@ async function saveImage(image, user_id) {
 		const { base64, extension } = parseBase64Image(image);
 		const file_name = `users/${user_id}.${extension}`;
 
-		const { error: uploadError } = await supabase.storage.from("images").upload(file_name, decode(base64), {
+		const { error: uploadError } = await supabase.storage.from("images").upload(file_name, Buffer.from(base64, "base64"), {
 			cacheControl: "3600",
 			upsert: true,
 		});
