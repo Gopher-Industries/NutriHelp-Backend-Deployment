@@ -2,6 +2,45 @@
 
 This is the backend API for the NutriHelp project. It exposes the REST endpoints used by the frontend, integrates with Supabase, serves OpenAPI documentation, and supports optional Python-based AI features used by some endpoints.
 
+## TLS 1.3 Configuration & Verification
+
+The root backend runtime now enforces TLS 1.3 only for HTTPS connections, adds HSTS headers, and redirects HTTP traffic to HTTPS.
+
+### TLS Configuration
+- **Protocol**: TLS 1.3 only (minVersion + maxVersion enforced)
+- **HSTS**: 2-year max-age with subdomains and preload
+- **Redirect**: HTTP requests automatically redirect to HTTPS
+- **Ports**: HTTPS on 443, HTTP redirect on 80
+- **Certificate Paths**: configurable via `TLS_KEY_PATH` and `TLS_CERT_PATH`
+
+### Verification Commands
+
+**Test TLS 1.3 Connection:**
+```bash
+openssl s_client -connect localhost:443 -tls1_3
+```
+
+**Test TLS 1.2 Block (should fail):**
+```bash
+openssl s_client -connect localhost:443 -tls1_2
+```
+
+**Check HSTS Header:**
+```bash
+curl -k -I https://localhost:443/api/system/health | grep -i strict-transport-security
+```
+
+**Test HTTP Redirect:**
+```bash
+curl -I http://localhost:80/api/system/health
+# Should return 301 redirect to https://localhost:443/api/system/health
+```
+
+**Certificate Verification:**
+```bash
+openssl x509 -in certs/local-cert.pem -text -noout
+```
+
 ## Quick Start
 
 If you want the fastest setup path for local development:
@@ -15,14 +54,26 @@ pip install -r requirements.txt
 
 Request the shared `.env` file from a project maintainer and place it in the project root, then start the backend:
 
+Generate a local TLS certificate first if you do not already have one:
+
+```bash
+mkdir -p certs
+openssl req -x509 -newkey rsa:2048 -nodes \
+  -keyout certs/local-key.pem \
+  -out certs/local-cert.pem \
+  -days 365 \
+  -subj "/CN=localhost"
+```
+
 ```bash
 npm start
 ```
 
 The backend will be available at:
 
-- `http://localhost:80`
-- `http://localhost:80/api-docs`
+- `https://localhost:443`
+- `https://localhost:443/api-docs`
+- `http://localhost:80` (redirects to HTTPS)
 
 If you prefer Docker, jump to [Docker Setup](#docker-setup).
 
@@ -294,53 +345,3 @@ The AI service is optional for some development flows, but this repository inclu
 
 - Patch history is available in [PatchNotes_VersionControl.yaml](/Users/tiennguyen/Desktop/Deakin/Test%20sever/Nutrihelp-api/PatchNotes_VersionControl.yaml).
 - Additional technical and security material is available under [technical_docs](/Users/tiennguyen/Desktop/Deakin/Test%20sever/Nutrihelp-api/technical_docs) and [security](/Users/tiennguyen/Desktop/Deakin/Test%20sever/Nutrihelp-api/security).
-
-## Deploying to Render
-
-This repository includes a `render.yaml` file that enables one-click deployment on [Render](https://render.com).
-
-### Steps
-
-1. **Fork or use this repository** — make sure the code is in a GitHub/GitLab repository connected to your Render account.
-
-2. **Connect the repository to Render** — in the Render dashboard click **New > Web Service**, select your repository, and Render will auto-detect `render.yaml`.
-
-3. **Set environment variables** — in the Render dashboard under **Environment**, add every variable listed in `.env.example`. Variables marked `sync: false` in `render.yaml` must be filled in manually:
-
-   | Variable | Description |
-   | --- | --- |
-   | `SUPABASE_URL` | Your Supabase project URL |
-   | `SUPABASE_ANON_KEY` | Supabase anonymous/public key |
-   | `JWT_TOKEN` | Secret used to sign JWT tokens |
-   | `SENDGRID_KEY` | SendGrid API key for email |
-   | `GMAIL_USER` | Gmail address for Nodemailer |
-   | `GMAIL_APP_PASSWORD` | Gmail app password for Nodemailer |
-   | `ALLOWED_ORIGINS` | Comma-separated list of allowed frontend origins (e.g. `https://nutrihelp.com,https://www.nutrihelp.com`) |
-
-4. **Deploy** — Render will run `npm install` then `npm start` automatically.
-
-### Health check
-
-Render confirms a successful deploy by polling:
-
-```
-GET /health
-```
-
-Expected response:
-
-```json
-{ "status": "ok", "timestamp": "...", "uptime": 0 }
-```
-
-### API docs
-
-Once deployed, the interactive API documentation is available at:
-
-```
-https://<your-service>.onrender.com/api-docs
-```
-
-### File upload warning
-
-> **Warning:** Render uses an ephemeral filesystem. Any files written to the local `uploads/` directory are permanently deleted on every deploy or restart. To persist user-uploaded files, migrate the upload destination to Supabase Storage or another external object store.
