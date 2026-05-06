@@ -1,17 +1,8 @@
 const bcrypt = require("bcryptjs");
 const crypto = require("crypto");
-const nodemailer = require("nodemailer");
-
 const supabase = require("../dbConnection");
 const { ServiceError } = require("./serviceError");
-
-const transporter = nodemailer.createTransport({
-  service: "gmail",
-  auth: {
-    user: process.env.GMAIL_USER,
-    pass: process.env.GMAIL_APP_PASSWORD,
-  },
-});
+const { sendPasswordResetEmail } = require("../utils/emailService");
 
 const RESET_CODE_TTL_MS = 10 * 60 * 1000;
 const RESET_TOKEN_TTL_MS = 15 * 60 * 1000;
@@ -239,24 +230,7 @@ async function updatePassword(userId, hashedPassword) {
 }
 
 async function sendResetEmail(email, code) {
-  if (!process.env.GMAIL_USER || !process.env.GMAIL_APP_PASSWORD) {
-    console.log(`📨 [DEV] Password reset code for ${email}: ${code}`);
-    return;
-  }
-
-  await transporter.sendMail({
-    from: `"NutriHelp Security" <${process.env.GMAIL_USER}>`,
-    to: email,
-    subject: "NutriHelp password reset code",
-    text:
-      `Your NutriHelp password reset code is ${code}.\n\n` +
-      "It expires in 10 minutes.\n\n" +
-      "If you did not request this, you can safely ignore this email.",
-    html:
-      `<p>Your NutriHelp password reset code is:</p><h2>${code}</h2>` +
-      "<p>This code expires in <strong>10 minutes</strong>.</p>" +
-      "<p>If you did not request this, you can safely ignore this email.</p>",
-  });
+  return sendPasswordResetEmail(email, code);
 }
 
 class PasswordResetService {

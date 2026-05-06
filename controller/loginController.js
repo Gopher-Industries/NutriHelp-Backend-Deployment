@@ -13,19 +13,10 @@ const { validationResult } = require("express-validator");
 const { logSecurityEvent } = require("../services/securityEventService");
 const { createLog, log } = require("../services/securityLogger");
 const logger = require("../utils/logger");
-const nodemailer = require("nodemailer");
+const { sendMfaEmail, sendFailedLoginAlertEmail } = require("../utils/emailService");
 const { ok, fail, validationError } = require("../utils/apiResponse");
 const { msg } = require("../utils/messages");
 const { sessionHookOnLoginSuccess } = require("../services/sessionLogService");
-
-
-const transporter = nodemailer.createTransport({
-  service: "gmail",
-  auth: {
-    user: process.env.GMAIL_USER,
-    pass: process.env.GMAIL_APP_PASSWORD,
-  },
-});
 
 function sanitizeUserForResponse(user) {
   if (!user) return user;
@@ -319,7 +310,7 @@ const loginMfa = async (req, res) => {
     }
 
     const token = createAccessToken(user);
-    return ok(res, { user: sanitizeUserForResponse(user), token });
+    return ok(res, { user: sanitizeUserForResponse(user), session: { accessToken: token } });
   } catch (err) {
     logger.error("MFA error", err);
     return fail(res, msg("general.internal_error"), 500, "INTERNAL_ERROR");
@@ -327,30 +318,7 @@ const loginMfa = async (req, res) => {
 };
 
 async function sendOtpEmail(email, token) {
-  try {
-    if (!process.env.GMAIL_USER || !process.env.GMAIL_APP_PASSWORD) {
-      console.log(`📨 [DEV] MFA code for ${email}: ${token}`);
-      return;
-    }
-
-    await transporter.sendMail({
-      from: `"NutriHelp Security" <${process.env.GMAIL_USER}>`,
-      to: email,
-      subject: "NutriHelp Login Token",
-      text: `Your one-time login token is: ${token}\n\nThis token expires in 10 minutes.\n\nIf you did not request this, please ignore this email.\n\n- NutriHelp Security Team`,
-      html: `
-        <p>Your one-time login token is:</p>
-        <h2>${token}</h2>
-        <p>This token expires in <strong>10 minutes</strong>.</p>
-        <p>If you did not request this, please ignore this email.</p>
-        <br/>
-        <p>- NutriHelp Security Team</p>
-      `,
-    });
-    console.log("OTP email sent successfully to", email);
-  } catch (err) {
-    console.error("Error sending OTP email:", err.message);
-  }
+  return sendMfaEmail(email, token);
 }
 
 const resendMfa = async (req, res) => {
@@ -372,7 +340,7 @@ const resendMfa = async (req, res) => {
 
     const token = crypto.randomInt(100000, 999999);
     await addMfaToken(user.user_id, token);
-    await sendOtpEmail(user.email, token);
+    await sendMfaEmail(user.email, token);
 
     return ok(res, { message: "A new MFA token has been sent to your email address" });
   } catch (err) {
@@ -383,25 +351,7 @@ const resendMfa = async (req, res) => {
 
 async function sendFailedLoginAlert(email, ip) {
   try {
-    if (!process.env.GMAIL_USER || !process.env.GMAIL_APP_PASSWORD) {
-      console.log(`[DEV] Failed login alert for ${email} from IP ${ip}`);
-      return;
-    }
-
-    await transporter.sendMail({
-      from: `"NutriHelp Security" <${process.env.GMAIL_USER}>`,
-      to: email,
-      subject: "Failed Login Attempt on NutriHelp",
-      text: `Hi,\n\nSomeone tried to log in to NutriHelp using your email address from IP: ${ip}.\n\nIf this wasn't you, please ignore this message. If you're concerned, consider resetting your password or contacting support.\n\n- NutriHelp Security Team`,
-      html: `
-        <p>Hi,</p>
-        <p>Someone tried to log in to <strong>NutriHelp</strong> using your email address from IP: <code>${ip}</code>.</p>
-        <p>If this wasn't you, please ignore this message. If you're concerned, consider resetting your password or contacting support.</p>
-        <br/>
-        <p>- NutriHelp Security Team</p>
-      `,
-    });
-    console.log(`Failed login alert sent to ${email}`);
+    await sendFailedLoginAlertEmail(email, ip);
   } catch (err) {
     console.error("Failed to send alert email:", err.message);
   }

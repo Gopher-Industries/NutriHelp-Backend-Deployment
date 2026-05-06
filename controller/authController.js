@@ -92,6 +92,14 @@ exports.login = async (req, res) => {
 
     const result = await authService.login({ email, password }, getDeviceInfo(req));
 
+    if (result.mfaRequired) {
+      return res.status(202).json(createSuccessResponse({
+        mfaRequired: true,
+        email: result.email,
+        message: 'An MFA token has been sent to your email address',
+      }));
+    }
+
     return res.json(createSuccessResponse({
       user: result.user,
       session: formatSession(result)

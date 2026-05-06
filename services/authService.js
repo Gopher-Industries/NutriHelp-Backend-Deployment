@@ -6,10 +6,12 @@ const { createClient } = require('@supabase/supabase-js');
 const jwt = require('jsonwebtoken');
 const bcrypt = require('bcrypt');
 const crypto = require('crypto');
+const { sendMfaEmail } = require('../utils/emailService');
 const { logSecurityEvent } = require('./securityEventService');
 const logLoginEvent = require('../Monitor_&_Logging/loginLogger');
 const { ServiceError } = require('./serviceError');
 const userProfileService = require('./userProfileService');
+const { addMfaToken } = require('../model/addMfaToken');
 
 const supabaseAnon = createClient(
   process.env.SUPABASE_URL,
@@ -20,6 +22,7 @@ const supabaseService = createClient(
   process.env.SUPABASE_URL,
   process.env.SUPABASE_SERVICE_ROLE_KEY
 );
+
 
 class AuthService {
   constructor() {
@@ -235,7 +238,7 @@ class AuthService {
         .from('users')
         .select(`
           user_id, email, password, name, role_id,
-          account_status, email_verified,
+          account_status, email_verified, mfa_enabled,
           user_roles!inner(id, role_name)
         `)
         .eq('email', email)
@@ -294,6 +297,13 @@ class AuthService {
 
         throw new Error('Invalid credentials');
       }
+      if (user.mfa_enabled) {
+        const mfaToken = crypto.randomInt(100000, 999999);
+        await addMfaToken(user.user_id, mfaToken);
+        await sendMfaEmail(user.email, mfaToken);
+        return { mfaRequired: true, email: user.email };
+      }
+
       const tokens = await this.generateTokenPair(user, deviceInfo);
 
       await supabaseAnon
