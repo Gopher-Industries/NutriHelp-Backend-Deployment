@@ -22,6 +22,15 @@ router.post(
   controller.requestReset,
 );
 
+// Alias — frontend uses this spelling
+router.post(
+  "/reset-request",
+  passwordRecoveryLimiter,
+  requestResetValidator,
+  validate,
+  controller.requestReset,
+);
+
 router.post(
   "/verify-code",
   passwordRecoveryLimiter,

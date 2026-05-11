@@ -121,4 +121,21 @@ async function sendFailedLoginAlertEmail(to, ip) {
   }
 }
 
-module.exports = { sendMfaEmail, sendPasswordResetEmail, sendFailedLoginAlertEmail };
+async function sendContactUsConfirmationEmail(to, { name, subject, message }) {
+  await sendEmail({
+    to,
+    subject: "We received your message - NutriHelp",
+    html: `
+      <p>Hi ${name},</p>
+      <p>Thank you for reaching out to NutriHelp!</p>
+      <p>We've received your message and our team will get back to you shortly.</p>
+      <p>Here's a copy of what you sent:</p>
+      <p><strong>Subject:</strong> ${subject}<br/>
+      <strong>Message:</strong> ${message}</p>
+      <br/>
+      <p>Warm regards,<br/>The NutriHelp Team<br/>nutrihelp2026@gmail.com</p>
+    `,
+  });
+}
+
+module.exports = { sendMfaEmail, sendPasswordResetEmail, sendFailedLoginAlertEmail, sendContactUsConfirmationEmail };

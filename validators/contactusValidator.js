@@ -25,6 +25,8 @@ const contactusValidator = [
         .trim()
         .notEmpty()
         .withMessage("Message is required")
+        .isLength({ min: 10 })
+        .withMessage("Message must be at least 10 characters")
         .isLength({ max: 500 })
         .withMessage("Message must not exceed 500 characters"),
 ];
