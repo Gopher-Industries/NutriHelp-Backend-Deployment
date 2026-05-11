@@ -6,8 +6,9 @@ module.exports = (req, res, next) => {
   if (!errors.isEmpty()) {
     return res.status(400).json({
       success: false,
+      code: 'VALIDATION_ERROR',
       errors: errors.array().map(err => ({
-        field: err.param,
+        field: err.path ?? err.param,
         message: err.msg
       }))
     });

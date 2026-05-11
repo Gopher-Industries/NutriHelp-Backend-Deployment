@@ -8,6 +8,10 @@ function getRequestContext(req) {
   };
 }
 
+function toValidationError(field, message) {
+  return { success: false, code: 'VALIDATION_ERROR', errors: [{ field, message }] };
+}
+
 async function signup(req, res) {
   try {
     const result = await signupService.signup({
@@ -22,15 +26,21 @@ async function signup(req, res) {
     return res.status(result.statusCode).json(result.body);
   } catch (error) {
     if (isServiceError(error)) {
-      const payload = error.details?.code
-        ? { code: error.details.code, error: error.message }
-        : { error: error.message };
+      const code = error.details?.code;
 
-      return res.status(error.statusCode).json(payload);
+      if (code === 'EMAIL_EXISTS') {
+        return res.status(400).json(toValidationError('email', 'Email is already registered'));
+      }
+
+      if (code === 'WEAK_PASSWORD') {
+        return res.status(400).json(toValidationError('password', error.message));
+      }
+
+      return res.status(error.statusCode).json({ success: false, error: error.message });
     }
 
-    console.error('Error creating user:', error);
-    return res.status(500).json({ error: 'Internal server error' });
+    console.error('Signup error:', error);
+    return res.status(500).json({ success: false, error: 'Internal server error' });
   }
 }
 
