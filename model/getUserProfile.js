@@ -6,20 +6,24 @@ async function decryptSensitiveFields(profile) {
 		return profile;
 	}
 
-	const decryptedContact = profile.contact_number ? await (async () => {
-		const encryptedObj = JSON.parse(profile.contact_number);
-		return await decrypt(encryptedObj.encrypted, encryptedObj.iv, encryptedObj.authTag);
-	})() : profile.contact_number;
-
-	const decryptedAddress = profile.address ? await (async () => {
-		const encryptedObj = JSON.parse(profile.address);
-		return await decrypt(encryptedObj.encrypted, encryptedObj.iv, encryptedObj.authTag);
-	})() : profile.address;
+	// Only attempt decryption when the value looks like the legacy per-column
+	// JSON-encoded encrypted format. Plain text and null values are returned as-is.
+	const tryDecryptField = async (value) => {
+		if (!value) return value;
+		let parsed;
+		try {
+			parsed = JSON.parse(value);
+		} catch (_) {
+			return value; // plain text — return unchanged
+		}
+		if (!parsed || !parsed.encrypted || !parsed.iv || !parsed.authTag) return value;
+		return await decrypt(parsed.encrypted, parsed.iv, parsed.authTag);
+	};
 
 	return {
 		...profile,
-		contact_number: decryptedContact,
-		address: decryptedAddress,
+		contact_number: await tryDecryptField(profile.contact_number),
+		address: await tryDecryptField(profile.address),
 	};
 }
 
@@ -28,7 +32,7 @@ async function getUserProfile(lookup = {}) {
 		const query = supabase
 			.from("users")
 			.select(
-				"user_id,name,first_name,last_name,email,contact_number,mfa_enabled,address,image_id,registration_date,last_login,account_status,user_roles!left(role_name)"
+				"user_id,name,first_name,last_name,email,contact_number,mfa_enabled,address,image_id,registration_date,last_login,account_status,user_roles!left(role_name),profile_encrypted,profile_encryption_iv,profile_encryption_auth_tag,profile_encryption_key_version"
 			);
 
 		if (lookup.userId != null) {

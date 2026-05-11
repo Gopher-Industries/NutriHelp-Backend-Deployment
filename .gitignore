@@ -10,8 +10,8 @@ test-results/
 server.pid
 server.log
 *.bak
-.env
 node_modules
+.claude/
 
 # TLS certificates and private keys — generate locally, never commit
 *.pem

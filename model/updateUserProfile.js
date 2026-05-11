@@ -6,20 +6,22 @@ async function decryptSensitiveFields(profile) {
 		return profile;
 	}
 
-	const decryptedContact = profile.contact_number ? await (async () => {
-		const encryptedObj = JSON.parse(profile.contact_number);
-		return await decrypt(encryptedObj.encrypted, encryptedObj.iv, encryptedObj.authTag);
-	})() : profile.contact_number;
-
-	const decryptedAddress = profile.address ? await (async () => {
-		const encryptedObj = JSON.parse(profile.address);
-		return await decrypt(encryptedObj.encrypted, encryptedObj.iv, encryptedObj.authTag);
-	})() : profile.address;
+	const tryDecryptField = async (value) => {
+		if (!value) return value;
+		let parsed;
+		try {
+			parsed = JSON.parse(value);
+		} catch (_) {
+			return value; // plain text — return unchanged
+		}
+		if (!parsed || !parsed.encrypted || !parsed.iv || !parsed.authTag) return value;
+		return await decrypt(parsed.encrypted, parsed.iv, parsed.authTag);
+	};
 
 	return {
 		...profile,
-		contact_number: decryptedContact,
-		address: decryptedAddress,
+		contact_number: await tryDecryptField(profile.contact_number),
+		address: await tryDecryptField(profile.address),
 	};
 }
 
