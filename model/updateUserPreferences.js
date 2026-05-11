@@ -132,10 +132,10 @@ async function updateUserPreferences(userId, body = {}) {
     const healthContext = normalizeHealthContext(body.health_context);
 
     const dietaryRequirements = Array.isArray(body.dietary_requirements) ? body.dietary_requirements : [];
-    const allergies = Array.isArray(body.allergies) ? body.allergies : listFromHealthContext(healthContext.allergies);
+    const allergies = Array.isArray(body.allergies) ? body.allergies : [];
     const cuisines = Array.isArray(body.cuisines) ? body.cuisines : [];
     const dislikes = Array.isArray(body.dislikes) ? body.dislikes : [];
-    const healthConditions = Array.isArray(body.health_conditions) ? body.health_conditions : listFromHealthContext(healthContext.chronic_conditions);
+    const healthConditions = Array.isArray(body.health_conditions) ? body.health_conditions : [];
     const spiceLevels = Array.isArray(body.spice_levels) ? body.spice_levels : [];
     const cookingMethods = Array.isArray(body.cooking_methods) ? body.cooking_methods : [];
 
@@ -147,26 +147,18 @@ async function updateUserPreferences(userId, body = {}) {
       'health_conditions',
       'spice_levels',
       'cooking_methods'
-    ].some((key) => body[key] !== undefined) || body.health_context !== undefined;
+    ].some((key) => body[key] !== undefined);
 
-    if (
-      !body.health_context
-      && !body.notification_preferences
-      && !body.ui_settings
-      && ![
-        'dietary_requirements',
-        'allergies',
-        'cuisines',
-        'dislikes',
-        'health_conditions',
-        'spice_levels',
-        'cooking_methods'
-      ].every((key) => hasOwnProperty(body, key))
-    ) {
-      throw new ServiceError(
-        400,
-        'All preference groups are required: dietary_requirements, allergies, cuisines, dislikes, health_conditions, spice_levels, cooking_methods'
-      );
+    if (shouldUpdateJoinTables) {
+      const missing = PREFERENCE_TABLES.map((t) => t.key).filter((key) => !Array.isArray(body[key]));
+      if (missing.length) {
+        throw new ServiceError(400,
+          `When updating food preferences, all groups must be provided. Missing: ${missing.join(', ')}`);
+      }
+    }
+
+    if (!shouldUpdateJoinTables && !body.health_context && !body.notification_preferences && !body.ui_settings) {
+      throw new ServiceError(400, 'At least one preference group is required');
     }
 
     if (shouldUpdateJoinTables) {

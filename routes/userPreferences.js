@@ -9,14 +9,26 @@ const {
 } = require("../validators/userPreferencesValidator");
 const ValidateRequest = require("../middleware/validateRequest");
 
+// GET /api/user/preferences/options — all available lookup options for dropdowns (no auth needed)
+router.get("/options", controller.getPreferenceOptionsHandler);
+
 // GET /api/user/preferences — authenticated user reads own preferences
 router.get("/", authenticateToken, controller.getUserPreferences);
 
-// POST /api/user/preferences — authenticated user updates own flat food preferences
+// POST /api/user/preferences — requires all 7 food preference arrays (full reset)
 router.post(
   "/",
   authenticateToken,
   validateUserPreferences,
+  ValidateRequest,
+  controller.postUserPreferences
+);
+
+// PUT /api/user/preferences — partial update: any combination of food prefs + health_context + notifications + ui
+router.put(
+  "/",
+  authenticateToken,
+  validateHealthContext,
   ValidateRequest,
   controller.postUserPreferences
 );

@@ -1,10 +1,7 @@
 const logger = require("../utils/logger");
 const { ServiceError } = require("../services/serviceError");
-const fetchUserPreferences = require("../model/fetchUserPreferences");
-const updateUserPreferences = require("../model/updateUserPreferences");
 const userPreferencesService = require("../services/userPreferencesService");
-
-const isPositiveInteger = (value) => Number.isInteger(value) && value > 0;
+const getPreferenceOptions = require("../model/getPreferenceOptions");
 
 function handleError(res, error, label, context = {}) {
   if (error instanceof ServiceError) {
@@ -30,15 +27,8 @@ function handleError(res, error, label, context = {}) {
 
 const getUserPreferences = async (req, res) => {
   try {
-    const userId = req.user.userId;
-    if (!userId) {
-      return res
-        .status(400)
-        .json({ success: false, error: "User ID is required" });
-    }
-
-    const userPreferences = await fetchUserPreferences(userId);
-    return res.status(200).json(userPreferences);
+    const response = await userPreferencesService.getExtendedPreferences(req.user.userId);
+    return res.status(200).json(response);
   } catch (error) {
     return handleError(res, error, "Error fetching user preferences", {
       userId: req.user?.userId,
@@ -48,13 +38,11 @@ const getUserPreferences = async (req, res) => {
 
 const postUserPreferences = async (req, res) => {
   try {
-    const userId = req.user?.userId;
-    if (!isPositiveInteger(userId)) {
-      throw new ServiceError(400, "User ID must be a positive integer");
-    }
-
-    await updateUserPreferences(userId, req.body);
-    return res.status(204).send();
+    const response = await userPreferencesService.updateExtendedPreferences(
+      req.user?.userId,
+      req.body
+    );
+    return res.status(200).json(response);
   } catch (error) {
     return handleError(res, error, "Error updating user preferences", {
       userId: req.user?.userId,
@@ -122,6 +110,15 @@ const updateNotificationPreferences = async (req, res) => {
   }
 };
 
+const getPreferenceOptionsHandler = async (req, res) => {
+  try {
+    const data = await getPreferenceOptions();
+    return res.status(200).json({ success: true, data });
+  } catch (error) {
+    return handleError(res, error, "Error fetching preference options");
+  }
+};
+
 module.exports = {
   getUserPreferences,
   postUserPreferences,
@@ -129,4 +126,5 @@ module.exports = {
   updateExtendedUserPreferences,
   getNotificationPreferences,
   updateNotificationPreferences,
+  getPreferenceOptionsHandler,
 };
