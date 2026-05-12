@@ -43,5 +43,6 @@ module.exports = app => {
     app.use('/api/recommendations', require('./recommendations'));
     app.use('/api/meal-plan', require('./mealPlanAIRoutes'));
 
-
+    app.use('/ai-model/chatbot', require('./ai/chatbot'));
+    app.use('/ai-model/medical-report/plan', require('./ai/healthPlan'));
 };
