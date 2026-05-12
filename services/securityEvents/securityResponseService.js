@@ -204,11 +204,18 @@ const resetForTests = () => {
   blockedIps.clear();
 };
 
+const unblockIp = (ip) => {
+  const existed = blockedIps.has(ip);
+  blockedIps.delete(ip);
+  return existed;
+};
+
 module.exports = {
   __resetForTests: resetForTests,
   createBlockMiddleware,
   getActiveBlock,
   getClientIp,
+  unblockIp,
   registerAuthFailure: (req, metadata = {}) =>
     registerEvent({ eventType: 'auth_failure', req, metadata }),
   registerRbacViolation: (req, metadata = {}) =>

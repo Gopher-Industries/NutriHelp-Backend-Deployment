@@ -6,6 +6,7 @@ const { authenticateToken } = require('../middleware/authenticateToken');
 const authorizeRoles = require('../middleware/authorizeRoles');
 const {
   createBlockMiddleware,
+  unblockIp,
 } = require('../services/securityEvents/securityResponseService');
 const { buildOverview } = require('../services/integrationAuditService');
 const {
@@ -279,5 +280,25 @@ router.get('/integration-audit/errors', async (req, res) => {
   }
 });
 
+
+// POST /api/system/unblock-ip
+// Accepts admin Bearer token OR x-system-recovery-key header
+router.post('/unblock-ip', (req, res, next) => {
+  const recoveryKey = req.headers['x-system-recovery-key'];
+  if (recoveryKey) {
+    if (!process.env.SYSTEM_RECOVERY_KEY || recoveryKey !== process.env.SYSTEM_RECOVERY_KEY) {
+      return res.status(403).json({ success: false, error: 'Invalid system recovery key.' });
+    }
+    return next();
+  }
+  authenticateToken(req, res, () => authorizeRoles('admin')(req, res, next));
+}, (req, res) => {
+  const { ip } = req.body;
+  if (!ip || typeof ip !== 'string') {
+    return res.status(400).json({ success: false, error: 'ip is required.' });
+  }
+  const removed = unblockIp(ip.trim());
+  res.json({ success: true, unblocked: removed, ip: ip.trim() });
+});
 
 module.exports = router;

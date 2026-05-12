@@ -39,7 +39,9 @@ module.exports = app => {
     // Add shopping list routes
     app.use('/api/shopping-list', require('./shoppingList'));
     app.use('/api/barcode', require('./barcodeScanning'));
+    app.use('/api/security/alerts', require('./alerts'));
     app.use('/api/security', require('./securityEvents'));
+    app.use('/api/admin', require('./adminUserRole'));
     app.use('/api/recommendations', require('./recommendations'));
     app.use('/api/meal-plan', require('./mealPlanAIRoutes'));
 
