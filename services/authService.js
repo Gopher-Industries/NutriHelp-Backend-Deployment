@@ -371,27 +371,23 @@ class AuthService {
         authMethod: 'oauth',
       });
 
-      await supabaseAnon
+      // Fire-and-forget — don't block the response for logging/updates
+      supabaseAnon
         .from('users')
-        .update({
-          last_login: new Date().toISOString(),
-          email_verified: true,
-        })
-        .eq('user_id', user.user_id);
+        .update({ last_login: new Date().toISOString(), email_verified: true })
+        .eq('user_id', user.user_id)
+        .then(() => {}).catch(() => {});
 
-      await this.logAuthAttempt(user.user_id, user.email, true, deviceInfo);
+      this.logAuthAttempt(user.user_id, user.email, true, deviceInfo);
 
-      await logSecurityEvent({
+      logSecurityEvent({
         event_type: 'LOGIN_SUCCESS',
         severity: 'low',
         user_id: user.user_id,
         ip_address: deviceInfo.ip || null,
         user_agent: deviceInfo.userAgent || null,
         resource: '/api/auth/google/exchange',
-        metadata: {
-          email: user.email,
-          provider: resolvedProvider,
-        }
+        metadata: { email: user.email, provider: resolvedProvider }
       });
 
       return this.formatAuthResponse(user, tokens, {
