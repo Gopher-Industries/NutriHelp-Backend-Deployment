@@ -116,13 +116,11 @@ class MedicalPredictionService {
     return {
       statusCode: 200,
       body: {
-        medical_report: [
-          {
-            obesity_prediction:  obesityResult,
-            diabetes_prediction: diabetesResult,
-            ...(bmi !== null ? { bmi: Math.round(bmi * 100) / 100 } : {}),
-          },
-        ],
+        medical_report: {
+          obesity_prediction:  obesityResult,
+          diabetes_prediction: diabetesResult,
+          ...(bmi !== null ? { bmi: Math.round(bmi * 100) / 100 } : {}),
+        },
         survey_id: null,
       },
     };
