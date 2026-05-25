@@ -88,13 +88,13 @@ class AuthService {
         user_roles!left(id, role_name)
       `)
       .eq('email', email)
-      .maybeSingle();
+      .limit(1);
 
     if (error) {
       throw error;
     }
 
-    return data || null;
+    return data?.[0] || null;
   }
 
   async createOAuthUser({ email, name, firstName, lastName, provider = 'google' }) {
@@ -177,13 +177,13 @@ class AuthService {
         throw new ServiceError(400, 'Name, email, and password are required');
       }
 
-      const { data: existingUser } = await supabaseAnon
+      const { data: existingUsers } = await supabaseAnon
         .from('users')
         .select('user_id')
         .eq('email', email)
-        .single();
+        .limit(1);
 
-      if (existingUser) {
+      if (existingUsers?.length > 0) {
         throw new ServiceError(400, 'User already exists');
       }
 
@@ -234,7 +234,7 @@ class AuthService {
         throw new ServiceError(400, 'Email and password are required');
       }
 
-      const { data: user, error } = await supabaseAnon
+      const { data: users, error } = await supabaseAnon
         .from('users')
         .select(`
           user_id, email, password, name, role_id,
@@ -242,7 +242,9 @@ class AuthService {
           user_roles!inner(id, role_name)
         `)
         .eq('email', email)
-        .single();
+        .limit(1);
+
+      const user = users?.[0] || null;
 
       if (error || !user) {
         await logSecurityEvent({
