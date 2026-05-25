@@ -35,16 +35,20 @@ const systemRoutes = require('./routes/systemRoutes');
 const { metricsMiddleware, metricsEndpoint } = require('./Monitor_&_Logging/metrics');
 const { runAlertCheckJob } = require('./services/securityAlertService');
 
+const app = express();
+const tlsKeyPath = process.env.TLS_KEY_PATH || path.join(__dirname, 'certs', 'local-key.pem');
+const tlsCertPath = process.env.TLS_CERT_PATH || path.join(__dirname, 'certs', 'local-cert.pem');
+const useTls = !process.env.RENDER && fs.existsSync(tlsKeyPath) && fs.existsSync(tlsCertPath);
+const PORT = Number(process.env.PORT) || (
+  useTls ? Number(process.env.HTTPS_PORT) || 8443
+         : Number(process.env.HTTP_PORT)  || 8081
+);
+
 console.log('🔧 Environment Variables Check:');
 console.log('   SUPABASE_URL:', process.env.SUPABASE_URL ? '✓ Set' : '✗ Missing');
 console.log('   SUPABASE_ANON_KEY:', process.env.SUPABASE_ANON_KEY ? '✓ Set' : '✗ Missing');
-console.log('   PORT:', process.env.PORT || '3000 (default)');
+console.log('   PORT:', PORT, useTls ? '(HTTPS)' : '(HTTP)');
 console.log('');
-
-const app = express();
-const PORT = Number(process.env.PORT) || 3000;
-const tlsKeyPath = process.env.TLS_KEY_PATH || path.join(__dirname, 'certs', 'local-key.pem');
-const tlsCertPath = process.env.TLS_CERT_PATH || path.join(__dirname, 'certs', 'local-cert.pem');
 
 let db = require('./dbConnection');
 
@@ -156,6 +160,12 @@ app.use(limiter);
 
 try {
   const swaggerDocument = yaml.load('./index.yaml');
+  if (process.env.RENDER_EXTERNAL_URL) {
+    swaggerDocument.servers = [
+      { url: `${process.env.RENDER_EXTERNAL_URL}/api`, description: 'Render' },
+      ...(swaggerDocument.servers || []),
+    ];
+  }
   app.use('/api-docs', swaggerUi.serve, swaggerUi.setup(swaggerDocument));
   console.log('📚 Swagger loaded successfully');
 } catch (e) {
@@ -229,10 +239,8 @@ function gracefulShutdown(signal) {
 process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
 process.on('SIGINT', () => gracefulShutdown('SIGINT'));
 
-// On Render, TLS is terminated at the proxy — app listens on plain HTTP.
-// For local dev, use HTTPS if self-signed certs exist; otherwise fall back to HTTP.
 let server;
-if (!process.env.RENDER && fs.existsSync(tlsKeyPath) && fs.existsSync(tlsCertPath)) {
+if (useTls) {
   const tlsOptions = {
     key: fs.readFileSync(tlsKeyPath),
     cert: fs.readFileSync(tlsCertPath),
