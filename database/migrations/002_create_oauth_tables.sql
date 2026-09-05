@@ -2,7 +2,6 @@
 -- Migration 002: OAuth 2.1 authorization server tables
 -- Ticket 35 — NutriHelp MCP integration
 --
--- Contract: docs/mcp-integration-contract.md (§ Tables, § Endpoints).
 -- Gates:    ticket 9 (D1) approved 2026-09-05; ticket 12 decided 2026-09-05
 --           (OAuth merges before the repository/database refactor).
 --
