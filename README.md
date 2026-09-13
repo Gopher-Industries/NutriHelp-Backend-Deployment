@@ -151,6 +151,7 @@ Common optional values:
 - `FROM_EMAIL`
 - `NODE_ENV`
 - `CORS_ORIGIN`
+- `FRONTEND_ORIGIN` (required in production; the exact browser origin allowed for credentialed requests)
 
 ### 4. Start the backend
 

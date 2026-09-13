@@ -89,33 +89,15 @@ app.use(sessionMonitorMiddleware);
 app.use(localeMiddleware);
 app.use(responseContractMiddleware);
 
-// Allowed origins: comma-separated list in ALLOWED_ORIGINS env var
-// e.g. ALLOWED_ORIGINS=https://nutrihelp.vercel.app,https://custom-domain.com
-const allowedOriginsEnv = process.env.ALLOWED_ORIGINS
-  ? process.env.ALLOWED_ORIGINS.split(',').map(o => o.trim()).filter(Boolean)
-  : [];
+const frontendOrigin = process.env.FRONTEND_ORIGIN || '';
+const allowedOriginsEnv = process.env.NODE_ENV === 'production'
+  ? []
+  : (process.env.ALLOWED_ORIGINS || '').split(',').map(o => o.trim()).filter(Boolean);
 
 const corsOrigin = (origin, callback) => {
   if (!origin) return callback(null, true);
 
-  // Allow Render's own service URL (Swagger UI same-service requests)
-  if (process.env.RENDER_EXTERNAL_URL && origin === process.env.RENDER_EXTERNAL_URL) {
-    return callback(null, true);
-  }
-
-  // Allow localhost / 127.0.0.1 on any port (covers Expo Web :19006, Metro :8081, etc.)
-  if (origin.startsWith('http://localhost') || origin.startsWith('http://127.0.0.1')) {
-    return callback(null, true);
-  }
-
-  // Allow Expo Go LAN dev client (http://<local-ip>:8081 and :19000)
-  if (/^http:\/\/192\.168\.\d+\.\d+:(8081|19000|19006)$/.test(origin) ||
-      /^http:\/\/10\.\d+\.\d+\.\d+:(8081|19000|19006)$/.test(origin)) {
-    return callback(null, true);
-  }
-
-  // Allow any *.vercel.app preview deploy (for web builds)
-  if (/^https:\/\/[a-z0-9-]+\.vercel\.app$/i.test(origin)) {
+  if (frontendOrigin && origin === frontendOrigin) {
     return callback(null, true);
   }
 
