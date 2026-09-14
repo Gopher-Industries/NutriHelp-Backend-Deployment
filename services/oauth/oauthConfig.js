@@ -27,8 +27,16 @@ const mcpAccessTokenIssuer = () => readEnv('MCP_AS_ISSUER');
 
 const mcpResourceIdentifier = () => readEnv('MCP_RESOURCE_IDENTIFIER');
 
+/**
+ * Exact Origin for user-facing OAuth routes. Literal string only — never a
+ * *.vercel.app pattern (server.js CORS has that hole). Null → middleware
+ * refuses; unset must never mean accept-anything.
+ */
+const frontendOrigin = () => readEnv('OAUTH_FRONTEND_ORIGIN');
+
 module.exports = {
   introspectionAudience,
   mcpAccessTokenIssuer,
   mcpResourceIdentifier,
+  frontendOrigin,
 };
