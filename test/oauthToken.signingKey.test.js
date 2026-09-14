@@ -1,4 +1,4 @@
-﻿// dbConnection.js calls process.exit(1) at require time when these are unset,
+// dbConnection.js calls process.exit(1) at require time when these are unset,
 // and no .env exists in CI or a fresh worktree. Must run before any require
 // below that transitively reaches it.
 process.env.SUPABASE_URL = process.env.SUPABASE_URL || 'https://example.supabase.co';
