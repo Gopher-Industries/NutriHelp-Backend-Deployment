@@ -12,9 +12,9 @@ const readEnv = (name) => {
   return trimmed === '' ? null : trimmed;
 };
 
-/** Absolute introspection URL, normalised as new URL(x).href (same as MCP). */
-const introspectionAudience = () => {
-  const configured = readEnv('MCP_INTROSPECTION_URL');
+/** Absolute endpoint URL, normalised as new URL(x).href (same as MCP). */
+const absoluteEndpointUrl = (variable) => {
+  const configured = readEnv(variable);
   if (!configured) return null;
   try {
     return new URL(configured).href;
@@ -22,6 +22,15 @@ const introspectionAudience = () => {
     return null;
   }
 };
+
+/** Absolute introspection URL, normalised as new URL(x).href (same as MCP). */
+const introspectionAudience = () => absoluteEndpointUrl('MCP_INTROSPECTION_URL');
+
+/** Q16a token-endpoint aud. No fallback to introspection URL. Unset → null → 503. */
+const tokenEndpointAudience = () => absoluteEndpointUrl('MCP_TOKEN_ENDPOINT_URL');
+
+/** Exchanged-credential aud (this API). Not MCP_RESOURCE_IDENTIFIER. */
+const backendApiAudience = () => readEnv('MCP_BACKEND_API_AUDIENCE');
 
 const mcpAccessTokenIssuer = () => readEnv('MCP_AS_ISSUER');
 
@@ -36,6 +45,8 @@ const frontendOrigin = () => readEnv('OAUTH_FRONTEND_ORIGIN');
 
 module.exports = {
   introspectionAudience,
+  tokenEndpointAudience,
+  backendApiAudience,
   mcpAccessTokenIssuer,
   mcpResourceIdentifier,
   frontendOrigin,
