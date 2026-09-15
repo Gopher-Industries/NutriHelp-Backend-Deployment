@@ -3,13 +3,16 @@ const express = require('express');
 const oauthIntrospectController = require('../controller/oauthIntrospectController');
 const oauthGrantsController = require('../controller/oauthGrantsController');
 const oauthTokenController = require('../controller/oauthTokenController');
+const oauthAuthorizeController = require('../controller/oauthAuthorizeController');
 const { authenticateToken } = require('../middleware/authenticateToken');
 const { requireExactOrigin } = require('../middleware/requireExactOrigin');
+const defaultOauthRateLimiters = require('../middleware/oauthRateLimiters');
 
 /**
  * OAuth authorization-server routes.
  *
  * Middleware per route — never router-wide:
+ *   GET  /authorize         anonymous; two rate buckets, no auth of any kind
  *   POST /introspect        private_key_jwt; no Origin
  *   POST /token             client auth is grant-specific (exchange needs
  *                           private_key_jwt; 39b auth_code is public+PKCE)
@@ -24,13 +27,26 @@ const { requireExactOrigin } = require('../middleware/requireExactOrigin');
  */
 const createOauthRouter = (deps = {}) => {
   const controller = deps.oauthIntrospectController || oauthIntrospectController;
+  const limiters = deps.oauthRateLimiters || defaultOauthRateLimiters;
   const router = express.Router();
+
+  // Ticket 36 + 45: anonymous; address + hostname buckets before CIMD fetch.
+  // No auth middleware — browser arrives with nothing to infer.
+  const authorizeController = deps.oauthAuthorizeController || oauthAuthorizeController;
+
+  router.get(
+    '/authorize',
+    limiters.authorizeAddressLimiter,
+    limiters.metadataFetchClientLimiter,
+    authorizeController.createAuthorizeController(deps)
+  );
 
   // Bind once; do not pass deps as a third handler arg (that is Express `next`).
   const introspectHandler = controller.createIntrospectController
     ? controller.createIntrospectController(deps)
     : (req, res) => controller.introspect(req, res, deps);
 
+  // MCP service rate limit lives in server.js (see oauthRateLimiters.MCP_SERVICE_PATHS).
   router.post(
     '/introspect',
     express.urlencoded({ extended: false, limit: '16kb' }),

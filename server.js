@@ -29,6 +29,7 @@ const cors = require('cors');
 const swaggerUi = require('swagger-ui-express');
 const yaml = require('yamljs');
 const rateLimit = require('express-rate-limit');
+const oauthRateLimiters = require('./middleware/oauthRateLimiters');
 
 const uploadRoutes = require('./routes/uploadRoutes');
 const systemRoutes = require('./routes/systemRoutes');
@@ -149,12 +150,18 @@ app.use(helmet({
   referrerPolicy: { policy: 'strict-origin-when-cross-origin' },
 }));
 
+// Ticket 45: MCP service bucket — unconditional, above global limiter + 50mb
+// parsers. Do not move into routes/oauth.js (see oauthRateLimiters.MCP_SERVICE_PATHS).
+app.use(oauthRateLimiters.MCP_SERVICE_PATHS, oauthRateLimiters.mcpServiceAddressLimiter);
+
 const limiter = rateLimit({
   windowMs: 15 * 60 * 1000,
   max: 1000,
   standardHeaders: true,
   legacyHeaders: false,
   message: { status: 429, error: 'Too many requests, please try again later.' },
+  // Skip only with the mount above. Authorize stays under this bucket too.
+  skip: oauthRateLimiters.isMcpServicePath,
 });
 app.use(limiter);
 
