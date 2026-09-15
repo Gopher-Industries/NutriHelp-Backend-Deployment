@@ -18,6 +18,18 @@ const oauthConfig = require('./oauthConfig');
 
 const ASSERTION_TYPE = 'urn:ietf:params:oauth:client-assertion-type:jwt-bearer';
 
+// Q16a: one verifier, one absolute URL per endpoint. Default is introspection
+// for ticket 42 call sites; /token must pass AUDIENCE_TOKEN_ENDPOINT explicitly.
+const AUDIENCE_INTROSPECTION = Object.freeze({
+  resolve: (config) => config.introspectionAudience(),
+  unconfiguredDetail: 'introspection_audience_unconfigured',
+});
+
+const AUDIENCE_TOKEN_ENDPOINT = Object.freeze({
+  resolve: (config) => config.tokenEndpointAudience(),
+  unconfiguredDetail: 'token_endpoint_audience_unconfigured',
+});
+
 /** Q16c allowlist. Narrowing is an amendment, not a refactor. */
 const Q16C_ALGORITHM_ALLOWLIST = Object.freeze(['RS256', 'ES256', 'EdDSA']);
 
@@ -94,10 +106,11 @@ const verifyClientAssertion = async (params = {}, deps = {}) => {
     return fail(400, 'invalid_request', 'client_assertion_absent');
   }
 
-  // Q16a: this endpoint's absolute URL only — never Host header / issuer / sibling.
-  const expectedAudience = config.introspectionAudience();
+  // Q16a: this endpoint's absolute URL only (caller-supplied; default = introspect).
+  const audience = deps.assertionAudience || AUDIENCE_INTROSPECTION;
+  const expectedAudience = audience.resolve(config);
   if (!expectedAudience) {
-    return fail(503, 'server_error', 'introspection_audience_unconfigured');
+    return fail(503, 'server_error', audience.unconfiguredDetail);
   }
 
   let decoded;
@@ -286,6 +299,8 @@ module.exports = {
   verifyClientAssertion,
   purgeExpiredJtis,
   ASSERTION_TYPE,
+  AUDIENCE_INTROSPECTION,
+  AUDIENCE_TOKEN_ENDPOINT,
   Q16C_ALGORITHM_ALLOWLIST,
   VERIFIABLE_ALGORITHMS,
   CLOCK_LEEWAY_SECONDS,

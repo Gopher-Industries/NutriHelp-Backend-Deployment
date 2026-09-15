@@ -2,16 +2,18 @@ const express = require('express');
 
 const oauthIntrospectController = require('../controller/oauthIntrospectController');
 const oauthGrantsController = require('../controller/oauthGrantsController');
+const oauthTokenController = require('../controller/oauthTokenController');
 const { authenticateToken } = require('../middleware/authenticateToken');
 const { requireExactOrigin } = require('../middleware/requireExactOrigin');
 
 /**
  * OAuth authorization-server routes.
  *
- * Two credentials, middleware per route — never router-wide:
- *   POST /introspect        private_key_jwt in body; no Origin
+ * Middleware per route — never router-wide:
+ *   POST /introspect        private_key_jwt; no Origin
+ *   POST /token             client auth is grant-specific (exchange needs
+ *                           private_key_jwt; 39b auth_code is public+PKCE)
  *   DELETE /grants/:grantId platform Bearer + exact Origin
- * Router-wide Origin would refuse MCP; router-wide authenticateToken would too.
  *
  * No trailing-slash redirect: MCP uses redirect:'error', so any 3xx hard-fails.
  *
@@ -34,6 +36,12 @@ const createOauthRouter = (deps = {}) => {
     express.urlencoded({ extended: false, limit: '16kb' }),
     introspectHandler
   );
+
+  // RFC 8693 exchange; grant_type dispatch is in the controller (39b adds siblings).
+  const tokenController = deps.oauthTokenController || oauthTokenController;
+  const tokenHandler = tokenController.createTokenController(deps);
+
+  router.post('/token', express.urlencoded({ extended: false, limit: '16kb' }), tokenHandler);
 
   // Ticket 43 disconnect. Auth then Origin (Origin after Bearer so anonymous
   // callers learn nothing about configured origins).
