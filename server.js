@@ -109,7 +109,7 @@ const corsOrigin = (origin, callback) => {
   callback(new Error(`CORS blocked: ${origin}`));
 };
 
-app.use(cors({ origin: corsOrigin, credentials: true, methods: ['GET','POST','PUT','PATCH','DELETE','OPTIONS'], allowedHeaders: ['Content-Type','Authorization'] }));
+app.use(cors({ origin: corsOrigin, credentials: true, methods: ['GET','POST','PUT','PATCH','DELETE','OPTIONS'], allowedHeaders: ['Content-Type','Authorization','X-CSRF-Token'] }));
 app.options('*', cors({ origin: corsOrigin, credentials: true }));
 app.use((req, res, next) => {
   res.header('Access-Control-Allow-Credentials', 'true');

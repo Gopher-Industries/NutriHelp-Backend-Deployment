@@ -40,7 +40,7 @@ function issueCsrfToken(_req, res) {
     sameSite: 'strict',
     path: '/api/consent',
   });
-  return res.json({ success: true, csrfToken: token });
+  return res.json({ success: true });
 }
 
 function requireCsrfToken(req, res, next) {

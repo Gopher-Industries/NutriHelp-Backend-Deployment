@@ -153,6 +153,8 @@ Common optional values:
 - `CORS_ORIGIN`
 - `FRONTEND_ORIGIN` (required in production; the exact browser origin allowed for credentialed requests)
 
+The consent approval endpoint also requires the ticket-35 OAuth migration and ticket-36 authorize flow. Apply `database/migrations/003_add_oauth_consent_approval.sql` only after those tables exist; this repository does not create the OAuth tables or authorize transactions.
+
 ### 4. Start the backend
 
 ```bash

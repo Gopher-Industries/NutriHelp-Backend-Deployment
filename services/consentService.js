@@ -6,7 +6,7 @@ function hashValue(value) {
 }
 
 async function approveConsent({ userId, transactionId, approvalToken }) {
-  if (!transactionId || !approvalToken) {
+  if (!userId || !transactionId || !approvalToken) {
     const error = new Error('transactionId and approvalToken are required');
     error.status = 400;
     throw error;
@@ -19,15 +19,15 @@ async function approveConsent({ userId, transactionId, approvalToken }) {
     throw error;
   }
 
-  const { data, error } = await supabase.rpc('approve_consent_transaction', {
+  const { data, error } = await supabase.rpc('approve_oauth_authorization', {
     p_transaction_id: transactionId,
     p_user_id: userId,
     p_approval_token_hash: hashValue(approvalToken),
   });
 
   if (error) {
-    const serviceError = new Error('Unable to approve consent transaction');
-    serviceError.status = 500;
+    const serviceError = new Error('Consent approval is unavailable until the OAuth schema is installed');
+    serviceError.status = error.code === '42883' ? 503 : 500;
     serviceError.cause = error;
     throw serviceError;
   }
@@ -41,7 +41,12 @@ async function approveConsent({ userId, transactionId, approvalToken }) {
     throw errorResponse;
   }
 
-  return data;
+  return {
+    authorizationCode: data.authorization_code,
+    transactionId: data.transaction_id,
+    redirectUri: data.redirect_uri,
+    state: data.state,
+  };
 }
 
 module.exports = { approveConsent };

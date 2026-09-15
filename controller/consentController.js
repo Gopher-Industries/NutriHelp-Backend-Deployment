@@ -8,7 +8,10 @@ async function approve(req, res, next) {
       approvalToken: req.body.approval_token,
     });
 
-    return res.status(200).json({ success: true, data: result });
+    return res.status(200).json({
+      success: true,
+      data: result,
+    });
   } catch (error) {
     return next(error);
   }
