@@ -19,3 +19,7 @@ node_modules
 *.crt
 *.p12
 certs/
+
+
+CLAUDE.md
+/docs
