@@ -10,7 +10,7 @@ const {
 describe('consent approval', () => {
   afterEach(() => sinon.restore());
 
-  it('hashes the single-use token and returns the authorization code from the OAuth transaction', async () => {
+  it('hashes the transaction reference and returns the authorization code', async () => {
     const rpc = sinon.stub().resolves({
       data: {
         status: 'approved',
@@ -28,15 +28,13 @@ describe('consent approval', () => {
     const result = await service.approveConsent({
       userId: 42,
       transactionId: 'transaction-1',
-      approvalToken: 'approval-secret',
     });
 
     expect(rpc.calledOnce).to.equal(true);
     expect(rpc.firstCall.args[0]).to.equal('approve_oauth_authorization');
     expect(rpc.firstCall.args[1]).to.deep.equal({
-      p_transaction_id: 'transaction-1',
+      p_transaction_hash: crypto.createHash('sha256').update('transaction-1').digest('hex'),
       p_user_id: 42,
-      p_approval_token_hash: crypto.createHash('sha256').update('approval-secret').digest('hex'),
     });
     expect(result).to.deep.equal({
       authorizationCode: 'one-time-code',
@@ -56,7 +54,7 @@ describe('consent approval', () => {
     });
 
     try {
-      await service.approveConsent({ userId: 42, transactionId: 'transaction-1', approvalToken: 'secret' });
+      await service.approveConsent({ userId: 42, transactionId: 'transaction-1' });
       throw new Error('Expected replay to be rejected');
     } catch (error) {
       expect(error.status).to.equal(409);
@@ -74,7 +72,7 @@ describe('consent approval', () => {
     });
 
     try {
-      await service.approveConsent({ userId: 42, transactionId: 'transaction-1', approvalToken: 'secret' });
+      await service.approveConsent({ userId: 42, transactionId: 'transaction-1' });
       throw new Error('Expected missing OAuth operation to be rejected');
     } catch (error) {
       expect(error.status).to.equal(503);

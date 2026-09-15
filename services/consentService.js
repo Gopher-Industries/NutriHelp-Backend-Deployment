@@ -5,9 +5,9 @@ function hashValue(value) {
   return crypto.createHash('sha256').update(String(value)).digest('hex');
 }
 
-async function approveConsent({ userId, transactionId, approvalToken }) {
-  if (!userId || !transactionId || !approvalToken) {
-    const error = new Error('transactionId and approvalToken are required');
+async function approveConsent({ userId, transactionId }) {
+  if (!userId || !transactionId) {
+    const error = new Error('transactionId is required');
     error.status = 400;
     throw error;
   }
@@ -20,9 +20,8 @@ async function approveConsent({ userId, transactionId, approvalToken }) {
   }
 
   const { data, error } = await supabase.rpc('approve_oauth_authorization', {
-    p_transaction_id: transactionId,
+    p_transaction_hash: hashValue(transactionId),
     p_user_id: userId,
-    p_approval_token_hash: hashValue(approvalToken),
   });
 
   if (error) {

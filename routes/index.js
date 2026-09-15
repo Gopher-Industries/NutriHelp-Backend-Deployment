@@ -23,6 +23,11 @@ module.exports = app => {
     app.use('/api/substitution', require('./ingredientSubstitution'));
     app.use('/api/auth', require('./auth'));
     app.use('/api/consent', require('./consent'));
+    // Dark deploy (ticket 56): mount only when exactly "true". Enable after
+    // mig 002 + ticket 45 rate limits (~1.1 req/s shared egress otherwise).
+    if (process.env.OAUTH_ROUTES_ENABLED === 'true') {
+        app.use('/api/oauth', require('./oauth'));
+    }
     app.use('/api/recipe/cost', require('./costEstimation'));
     app.use('/api/chatbot', require('./chatbot'));
     // app.use('/api/obesity', require('./obesityPrediction'));

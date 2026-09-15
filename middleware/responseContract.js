@@ -23,6 +23,8 @@ const SKIP_PATHS = [
   /^\/api\/metrics/,
   /^\/uploads\//,
   /^\/$/,
+  // OAuth bodies are RFC-shaped; skip envelope / _contractWarnings injection.
+  /^\/api\/oauth\//,
 ];
 
 function shouldSkip(path) {
