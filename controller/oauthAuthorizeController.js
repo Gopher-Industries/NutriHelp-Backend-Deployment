@@ -5,54 +5,26 @@ const introspectionLog = require('../services/oauth/introspectionLog');
 const oauthConfig = require('../services/oauth/oauthConfig');
 
 /**
- * GET /api/oauth/authorize — ticket 36.
+ * GET /api/oauth/authorize — ticket 36. No session / no credential.
  *
- * Infers no browser session and reads no credential. The browser is redirected
- * here from the assistant with nothing identifying the user, so the endpoint
- * persists the request and bounces to the frontend login page carrying only an
- * opaque reference.
+ *   302 frontend login   success — query = opaque transaction only
+ *   302 redirect_uri     OAuth error once URI proven (incl. our server_error)
+ *   400                  refused before proof (malformed / bad client / URI)
+ *   503                  issuer unset, or unhandled exception
  *
- *   302 -> frontend login   request accepted, reference in the query
- *   302 -> redirect_uri     OAuth error, only once that URI is proven — and
- *                           that includes OUR failures: a bad resource
- *                           identifier, a broken frontend config, a failed
- *                           write. Past the proof, the client is told.
- *   400                     malformed request, bad client, or unregistered
- *                           redirect_uri — everything refused BEFORE the proof
- *   503                     the issuer is unconfigured, or an unhandled
- *                           exception. Nothing else.
- *
- * ⚠️ NEVER put a NutriHelp token in any of these URLs. The frontend redirect
- * carries the transaction reference and nothing else — the contract's wording
- * is "only the opaque identifier", and a second parameter is how request
- * details start leaking through Referer and browser history.
- *
- * The RFC 9207 `iss` goes on client-directed responses, which at this endpoint
- * means the error redirects; correct clients reject an authorization response
- * that arrives without it. The frontend redirect is not a client-directed
- * authorization response and deliberately does not carry it.
+ * ⚠️ Never put a NutriHelp token in any URL. RFC 9207 `iss` only on
+ * client-directed error redirects — not on the frontend hop.
  */
 
 const AUTHORIZE_EVENT_TYPE = 'mcp_authorize_request_refused';
 const DEFAULT_LOGIN_PATH = '/login';
 
 /**
- * Refusal reasons that get a security-sink record, not just an operational
- * line — the ones where the caller named something that is not theirs.
- *
- * ⚠️ ONE LAYER OWNS EACH REASON. `client_type_not_dereferenceable` is
- * deliberately NOT here: clientMetadataService already raises its own
- * DEREFERENCE_REFUSED_EVENT for it, and listing it here too produced two
- * security records for one attempt. A sink that double-counts is a sink whose
- * numbers cannot be trusted, so the rule is: the layer that DISCOVERS a
- * refusal emits it. This controller discovers redirect_uri_not_registered and
- * the client-row conflict; the CIMD layer discovers everything about the
- * document. `client_inactive` stays here because that layer returns it without
- * logging, so removing it would lose the record entirely rather than
- * de-duplicate it.
- *
- * The redirected failures (bad scope, bad resource, malformed PKCE) are
- * ordinary protocol errors, not attack shapes, and stay operational-only.
+ * Attack-shaped reasons → security sink. ⚠️ One layer owns each reason:
+ * discovering layer emits. Not listed: client_type_not_dereferenceable (CIMD
+ * already emits). Listed: client_inactive (CIMD returns it without logging),
+ * redirect_uri_not_registered, client_conflicts_with_non_assistant_row.
+ * Ordinary protocol errors stay operational-only.
  */
 const SECURITY_EVENT_REASONS = new Set([
   'redirect_uri_not_registered',
@@ -61,14 +33,7 @@ const SECURITY_EVENT_REASONS = new Set([
 ]);
 
 /**
- * A configured path, never a URL and never a query.
- *
- * '//host' and 'https://host' both redirect off-origin. A '?' or '#' is a
- * quieter failure of the same kind: '/login?next=/x' would produce
- * '?next=/x&transaction=…', and the one property this redirect has to keep is
- * that it carries the opaque identifier and nothing else. Refused rather than
- * normalised — silently stripping an operator's query would be its own
- * surprise.
+ * Same-origin path only — no '//', '?', '#'. Refused, not normalised.
  */
 const readLoginPath = () => {
   const raw = process.env.OAUTH_FRONTEND_LOGIN_PATH;
@@ -80,10 +45,8 @@ const readLoginPath = () => {
 };
 
 /**
- * Resolves where the browser is sent on success. Called only AFTER
- * redirect_uri is proven, so every failure it reports is deliverable to the
- * client rather than shown to a stranger's browser as a 503.
- *
+ * Success redirect base — only after redirect_uri is proven (failures deliver
+ * to the client, not JSON 503 to a stranger).
  * @returns {{ok: true, url: URL} | {ok: false, reason: string}}
  */
 const resolveFrontendBase = (config) => {
@@ -100,9 +63,7 @@ const resolveFrontendBase = (config) => {
     return { ok: false, reason: 'frontend_origin_unparseable' };
   }
 
-  // A control character in the path can make it protocol-relative once WHATWG
-  // parsing strips the character, so compare the resulting origin rather than
-  // trusting readLoginPath's string checks alone.
+  // Control chars can become protocol-relative after WHATWG strip — compare origins.
   let configuredOrigin;
   try {
     configuredOrigin = new URL(frontendOrigin).origin;
@@ -115,9 +76,7 @@ const resolveFrontendBase = (config) => {
 };
 
 /**
- * The one place a client-directed error response is built. RFC 6749 §3.1.2:
- * start from the registered URI so a query string it already carries survives.
- * RFC 9207: `iss` on every client-directed response.
+ * Client-directed error: RFC 6749 §3.1.2 (preserve registered query) + RFC 9207 iss.
  */
 const redirectToClient = (res, redirectUri, error, state, issuer) => {
   const destination = new URL(redirectUri);
@@ -136,11 +95,7 @@ const createAuthorizeController = (deps = {}) => {
     const correlationId = req.get ? req.get('x-correlation-id') : undefined;
     const requestId = crypto.randomUUID();
 
-    // The abused client_id is the single most useful field under the
-    // amplification attack the rate buckets exist to bound, so it is recorded
-    // on every line rather than only on success. Untrusted and unvalidated at
-    // this point — it is evidence of what was attempted, not an assertion that
-    // the client exists. Bounded so a huge query value cannot bloat the sink.
+    // Attempted client_id (untrusted, bounded) — useful under amplification.
     const attemptedClientId =
       typeof req.query.client_id === 'string' ? req.query.client_id.slice(0, 512) : null;
 
@@ -154,25 +109,10 @@ const createAuthorizeController = (deps = {}) => {
       resource: authorizeTransactionService.AUTHORIZE_ENDPOINT,
     };
 
-    // correlationId/requestId must reach the CIMD layer too, or its
-    // metadata_fetch_refused lines carry correlation_id: null and cannot be
-    // joined to the authorize refusal that caused them.
+    // Join authorize refusals to CIMD metadata_fetch_refused lines.
     const serviceDeps = { ...deps, correlationId, requestId };
 
-    /**
-     * One operational line for every refusal, plus a security record when the
-     * reason is attack-shaped.
-     *
-     * Both branches go through here because the attack shapes are no longer
-     * all on one side: the client-row conflict is delivered as a REDIRECT
-     * (blocker 2 — past the redirect_uri proof, even server errors reach the
-     * client), while redirect_uri_not_registered is still answered directly.
-     * Keying the security emit off the branch instead of the reason would
-     * silently drop the conflict record.
-     *
-     * logOperational drops eventType and resource, so the security sink is
-     * only reached by the explicit logGrantRefusal call.
-     */
+    // Operational always; security when reason is attack-shaped (incl. redirected conflicts).
     const recordRefusal = async (outcome, reason, httpStatus) => {
       await log.logOperational({ ...logContext, outcome, detail: reason, httpStatus }, deps);
       if (SECURITY_EVENT_REASONS.has(reason)) {
@@ -189,31 +129,17 @@ const createAuthorizeController = (deps = {}) => {
     };
 
     try {
-      // Redirects are cacheable by default and this one carries a credential-
-      // shaped reference.
       res.set('Cache-Control', 'no-store');
 
-      // ISSUER ONLY. This is the one config value that must be resolved before
-      // the request is processed, because every client-directed error carries
-      // RFC 9207 `iss` and a compliant client rejects an authorization
-      // response that arrives without it. With no issuer there is no way to
-      // produce a deliverable error at all, so 503 here is the honest answer.
-      //
-      // ⚠️ NOTHING ELSE BELONGS ABOVE THIS CALL. The frontend origin and login
-      // path are needed only to build the SUCCESS redirect, and hoisting them
-      // meant a misconfigured OAUTH_FRONTEND_ORIGIN turned every refusal —
-      // including an ordinary invalid_scope from a correctly registered client
-      // — into a JSON 503 the assistant could not read. That is the same
-      // failure the service's own redirect boundary exists to prevent, so the
-      // controller must not reintroduce it one layer up.
+      // Issuer only above the request — needed for RFC 9207 iss on every
+      // client-directed error. Frontend origin/login path resolve AFTER proof
+      // so a bad OAUTH_FRONTEND_ORIGIN cannot turn invalid_scope into JSON 503.
       const issuer = config.mcpAccessTokenIssuer();
       if (!issuer) return await unavailable('issuer_unset');
 
       const result = await service.startAuthorization(req.query, serviceDeps);
 
       if (result.ok) {
-        // Resolved HERE, not earlier: by this point redirect_uri is proven, so
-        // a configuration failure can still be delivered to the client.
         const base = resolveFrontendBase(config);
         if (!base.ok) {
           await recordRefusal('authorize_refused_redirect', base.reason, 302);
@@ -230,13 +156,8 @@ const createAuthorizeController = (deps = {}) => {
         return redirectToClient(res, result.redirectUri, result.error, result.state, issuer);
       }
 
-      // Every direct refusal is a 400. There used to be a `status === 503`
-      // branch here for server-side failures the service answered directly;
-      // those all redirect now, so the branch became unreachable and was
-      // removed rather than left reading as though it still did something.
       await recordRefusal('authorize_refused_direct', result.reason, 400);
-      // The reason stays in the log. The browser is a stranger's browser here
-      // and the detail would describe our client registry back to them.
+      // Reason stays in the log — do not describe the registry to the browser.
       return res.status(400).json({ error: result.error });
     } catch (err) {
       // Express 4 does not route rejected promises to the error handler.

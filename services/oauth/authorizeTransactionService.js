@@ -9,48 +9,30 @@ const oauthConfig = require('./oauthConfig');
 /**
  * Authorization request intake (ticket 36).
  *
- * The browser arrives here redirected from the assistant, carrying NOTHING
- * that identifies the user: the web app keeps its platform token in browser
- * storage and there is no login cookie. So this service never tries to resolve
- * a user. It validates the request, persists it, and hands back an opaque
- * reference for the frontend login page to carry.
+ * No browser session / no user resolution — validate, persist a hashed opaque
+ * reference, hand it to the frontend login page.
  *
- * The ordering below is the security property, not a style choice:
+ * Order is the security property:
+ *   1. client-independent shape (incl. PKCE / response_type — no fetch yet)
+ *   2. CIMD resolve (ticket 41)  <-- outbound fetch
+ *   3. prove redirect_uri against that client's list
+ *   --- past here EVERY failure redirects to redirect_uri, 503s included ---
+ *   4. client-dependent checks, then persistence
  *
- *   1. every check that does not depend on the client — including PKCE and
- *      response_type, which sit here so a malformed request costs no fetch
- *   2. resolve the client through CIMD (ticket 41)   <-- the outbound fetch
- *   3. match redirect_uri against that client's registered list
- *   --- past here EVERY failure is redirected to redirect_uri, 503s included ---
- *   4. everything that needed a resolved client, then persistence
- *
- * A failure redirected before step 3 completes is an open redirector, and
- * hands the OAuth error response to whoever chose the URL. A failure answered
- * directly AFTER step 3 is the opposite mistake: the assistant is told nothing
- * and the user is stranded mid-flow. Both have been live bugs in this file.
- *
- * ⚠️ Never add a column for the platform bearer token. Migration 002 has none
- * and the table comment says why.
+ * Redirect before step 3 = open redirector. Direct answer after step 3 =
+ * strands the assistant. ⚠️ Never store a platform bearer (mig 002).
  */
 
 /** From the contract's Scopes table. Coarse and per-capability, by design. */
 const SUPPORTED_SCOPES = ['nutrition:read', 'mealplan:read', 'meallog:write'];
 
-/**
- * Long enough for a human to find their password, short enough that a
- * reference leaked through browser history is usually already dead.
- * Authorization codes are 60s; this one has to span a login.
- */
+/** Spans a login; codes are 60s. Leaked refs should usually be dead already. */
 const TRANSACTION_TTL_SECONDS = 600;
 
-/** RFC 7636 §4.2: 43-128 chars of unreserved. 43 is the SHA-256 case. */
+/** RFC 7636 §4.2: 43-128 unreserved. 43 = SHA-256. */
 const CODE_CHALLENGE_PATTERN = /^[A-Za-z0-9\-._~]{43,128}$/;
 
-/**
- * `state` is attacker-chosen, stored, and reflected into a redirect URL. RFC
- * 6749 sets no limit; this one is ours. Generous next to any real client's
- * nonce, small next to anything worth calling an amplifier.
- */
+/** Attacker-chosen and reflected; RFC sets no limit — this one is ours. */
 const MAX_STATE_LENGTH = 512;
 
 /** 32 bytes — the reference must not be cheaper to guess than the code. */
@@ -61,17 +43,7 @@ const AUTHORIZE_ERROR_PREFIX = 'oauth_authorize';
 
 const isNonEmptyString = (value) => typeof value === 'string' && value.trim() !== '';
 
-/**
- * Refusal the caller must answer directly — redirect_uri is not yet proven.
- *
- * Always 400, and the shape carries no status at all on purpose. It used to
- * take a status parameter so server-side failures could answer 503 from below
- * the redirect boundary; those all redirect now. Both the parameter AND the
- * field are gone: leaving an inert `httpStatus` behind would be worse than the
- * unreachable branch it fed, because someone setting it on a future variant
- * would see it silently ignored. The controller answers 400 for every direct
- * refusal, and there is nothing here for it to read.
- */
+/** Direct refusal — redirect_uri not yet proven. Always 400; no status field. */
 const refuseDirect = (error, reason) => ({
   ok: false,
   redirectable: false,
@@ -95,24 +67,9 @@ const hashTransactionReference = (reference) =>
 const newTransactionReference = () => crypto.randomBytes(REFERENCE_BYTES).toString('base64url');
 
 /**
- * Only a single query value is ever accepted. Express gives an array when a
- * key repeats; taking the first silently would let a caller smuggle a second
- * redirect_uri past a check that only read one of them.
- *
- * `scope` is the ONE deliberate exception and does not go through this: it is
- * a space-delimited list, so the repeated-key form is a legitimate spelling of
- * the same value. Accepting both cannot escalate — every element is still
- * filtered against SUPPORTED_SCOPES below, and a request can only ever narrow
- * to what the user later approves. Pinned by the "accepts the repeated-key
- * array form of scope" test.
- *
- * Precisely: parseScope splits a STRING on whitespace, and for an ARRAY takes
- * the elements as-is WITHOUT splitting them. So ?scope=a&scope=b works, while
- * the mixed ?scope=a+b&scope=c would yield the element "a b", which fails
- * SUPPORTED_SCOPES and refuses. That is fail-closed and fine; it is not a
- * merge, and describing it as one overstates what the helper does.
- * introspectionService.parseScope is shared with the token-exchange path, so
- * it is not changed from here.
+ * Single query value only — Express arrays on repeated keys; taking the first
+ * would smuggle a second redirect_uri. `scope` is the exception (space- or
+ * repeated-key list); every element still filters against SUPPORTED_SCOPES.
  */
 const singleValue = (value) => {
   if (Array.isArray(value)) return undefined;
@@ -135,39 +92,15 @@ const startAuthorization = async (query = {}, deps = {}) => {
 
   const redirectUri = singleValue(query.redirect_uri);
   if (!isNonEmptyString(redirectUri)) {
-    // RFC 6749 §4.1.2.1: with no usable redirect_uri the error cannot be
-    // delivered to the client, so it is shown here instead.
+    // No usable redirect_uri → cannot deliver to client (§4.1.2.1).
     return refuseDirect('invalid_request', 'redirect_uri_absent');
   }
 
-  // ⚠️ DELIBERATE RFC 6749 DEVIATION — the three checks below answer 400
-  // DIRECTLY rather than redirecting to redirect_uri, and they sit here, ABOVE
-  // the outbound fetch, on purpose.
-  //
-  // Delivering them as redirects would mean proving redirect_uri first, which
-  // means dereferencing a stranger-chosen URL first. That is the amplifier
-  // ticket 45 exists to contain: without this, a request with a garbage
-  // response_type still costs a real outbound GET to a host the caller picked.
-  // Rate limits bound that, but every request pays a fetch until a bucket
-  // trips.
-  //
-  // The trade is narrow and it is only taken for SYNTACTICALLY malformed
-  // requests. A client sending response_type != 'code', no PKCE challenge, or
-  // a downgraded method is broken, not unlucky; a clear 400 serves it as well
-  // as a redirect would. Refusing early creates no open redirect — refusing is
-  // not redirecting.
-  //
-  // Errors a WORKING client can legitimately hit (unsupported scope, wrong
-  // resource) stay below the redirect boundary, where they reach the assistant
-  // and it can tell the user what happened.
-  //
-  // `state` is checked here for the same reason and one extra one: it is the
-  // client's OWN nonce, so an over-long state is the client being broken about
-  // its own value. Refusing it below the boundary would also have been futile
-  // — the error could not carry the offending state back, and a client that
-  // receives an error with no state cannot match it to a pending request and
-  // must drop it. That is paying an outbound fetch to deliver something the
-  // client is obliged to ignore.
+  // ⚠️ DELIBERATE RFC 6749 DEVIATION — syntactic malformations (state length,
+  // response_type, PKCE) answer 400 here, ABOVE the outbound fetch. Proving
+  // redirect_uri first would fetch a stranger-chosen URL (ticket 45 amplifier).
+  // Working-client errors (unsupported scope, wrong resource) stay below the
+  // redirect boundary so the assistant can act on them.
   const rawState = singleValue(query.state);
   const state = isNonEmptyString(rawState) ? rawState : null;
   if (state !== null && state.length > MAX_STATE_LENGTH) {
@@ -195,33 +128,20 @@ const startAuthorization = async (query = {}, deps = {}) => {
     return refuseDirect('invalid_request', 'code_challenge_method_not_s256');
   }
 
-  // --- 2. resolve the client ------------------------------------------------
-  // Reuses ticket 41 whole: SSRF address guard, no redirects, size cap, one
-  // deadline, and the service_confidential refusal. A second fetcher here
-  // would be a second list to keep in step.
+  // --- 2. resolve the client (ticket 41 whole — do not fork a second fetcher)
   const resolved = await clientMetadataService.fetchAndValidateClientMetadata(clientId, deps);
   if (!resolved.ok) {
-    // `invalid_request`, not `invalid_client`. RFC 6749 §5.2's `invalid_client`
-    // belongs to the TOKEN endpoint; the authorization endpoint's set (§4.1.2.1)
-    // is invalid_request, unauthorized_client, access_denied,
-    // unsupported_response_type, invalid_scope, server_error and
-    // temporarily_unavailable. The specific reason is in the log either way.
+    // Authorize endpoint (§4.1.2.1): invalid_request — not token-endpoint
+    // invalid_client (§5.2). Detail stays in the log.
     return refuseDirect('invalid_request', resolved.reason);
   }
 
-  // --- 3. prove the redirect_uri -------------------------------------------
-  // The single matcher, shared with ticket 41. Exact match, with only the
-  // RFC 8252 loopback-port exception.
+  // --- 3. prove the redirect_uri (ticket 41 matcher; RFC 8252 loopback) ----
   if (!redirectUriMatcher.matchesAny(resolved.metadata.redirect_uris, redirectUri)) {
     return refuseDirect('invalid_request', 'redirect_uri_not_registered');
   }
 
-  // --- everything past here IS redirected to the client --------------------
-  // No exceptions below this line, including server-side failures. The comment
-  // used to say "may be", and three 503s underneath it answered the browser
-  // directly — which strands the user mid-flow with the assistant given no
-  // OAuth error it can read. RFC 6749 §4.1.2.1 has `server_error` for exactly
-  // this and expects it at the validated redirect_uri.
+  // --- everything past here IS redirected (incl. server_error) -------------
   const redirectFailure = (error, reason) => refuseRedirect(error, reason, redirectUri, state);
 
   const requestedScopes = introspectionService.parseScope(query.scope);
@@ -233,12 +153,9 @@ const startAuthorization = async (query = {}, deps = {}) => {
     return redirectFailure('invalid_scope', 'scope_not_supported');
   }
 
-  // Configured, never derived from the request — same rule as the assertion
-  // audience in oauthConfig.
+  // Configured resource only — never from the request.
   const configuredResource = oauthConfig.mcpResourceIdentifier();
   if (!isNonEmptyString(configuredResource)) {
-    // Our misconfiguration, but it is delivered to the client: the assistant
-    // cannot act on a 503 it never sees.
     return redirectFailure('server_error', 'resource_identifier_unset');
   }
   if (singleValue(query.resource) !== configuredResource) {
@@ -246,63 +163,21 @@ const startAuthorization = async (query = {}, deps = {}) => {
   }
 
   // --- 4. persist -----------------------------------------------------------
-  // The client row must exist before the transaction's composite FK can
-  // resolve. clientMetadataService validates and deliberately writes nothing;
-  // ticket 36 owns this write.
+  // CIMD validates and writes nothing; ticket 36 owns the row for the FK.
   //
-  // ⚠️ NEVER make this an unconditional upsert on client_id. It used to be, and
-  // that would UPDATE an existing service_confidential row — the MCP server's
-  // own client — into client_type 'assistant_public' with auth method 'none',
-  // silently breaking private_key_jwt.
+  // ⚠️ NEVER unconditional upsert on client_id — that overwrites
+  // service_confidential into assistant_public / auth none. CIMD's document
+  // refusal does not protect the DB row.
   //
-  // The CIMD layer's confidential refusal does NOT defend this. That inspects
-  // the fetched DOCUMENT; this writes a database ROW. Two different objects,
-  // and nothing there constrains what is already stored under that key. It was
-  // a check on one thing standing in for a check on another, with a TOCTOU
-  // window between them that any concurrent admin insert lands in.
-  //
-  // So the write is conditional:
   //   UPDATE ... WHERE client_id = ? AND client_type = 'assistant_public'
-  //   -> a row matched? done.
-  //   -> no row matched? INSERT.
-  //   -> INSERT hits the primary key (23505)? RE-RUN THE UPDATE ONCE, then
-  //      decide.
-  //
-  // ⚠️ THAT RETRY IS NOT OPTIONAL, and the reason is a direction that is easy
-  // to get backwards. It is true that the insert cannot SUCCEED against a row
-  // the update would not have matched. The direction that matters is the
-  // converse: the insert CAN FAIL against a row the update WOULD have matched,
-  // because the row can be created between the two statements.
-  //
-  // Two concurrent first-sight requests for the same new assistant do exactly
-  // that — both updates match nothing, A inserts, B collides. Without the
-  // retry B is refused for a legitimate request AND, because this reason is
-  // security-logged, a false record is written claiming B named a client id
-  // belonging to something else. A false positive in the one sink that exists
-  // to flag real attack shapes.
-  //
-  // So 23505 means only "a row now exists". The SECOND UPDATE is what
-  // distinguishes whose it is: it matches, and we proceed, only if the row is
-  // assistant_public.
-  //
-  // ONE retry, never a loop, and one is enough: 23505 proves a row exists, and
-  // the second UPDATE classifies it, so a further retry could only re-ask a
-  // question already answered. The accepted residual is the other way round —
-  // if the row were DELETED between the failed insert and the retry, the retry
-  // matches nothing and the request is refused as a conflict it is not. That
-  // needs an insert and a delete inside microseconds, it fails CLOSED, and
-  // looping to chase it would trade a rare false refusal for an unbounded one.
-  //
-  // ⚠️ `matched.length === 0` carries more weight than it looks like. If RLS
-  // were ever enabled on oauth_clients with a policy that hides rows from
-  // .select(), this select would return [] even after a successful update and
-  // every request would fall into a permanent false conflict. RLS is off here
-  // (the service-role key bypasses it), but that is the assumption this
-  // depends on.
+  //   -> matched? done.  -> else INSERT.
+  //   -> INSERT 23505? RE-RUN UPDATE ONCE (23505 = "a row exists", not whose).
+  // Concurrent first-sight: both miss update, A inserts, B collides — retry
+  // classifies; without it B false-positives into the security sink.
+  // One retry, never a loop. Residual: DELETE between failed insert and retry
+  // fails closed. ⚠️ empty .select() after update assumes RLS off (service role).
   const clientRow = {
     client_id: resolved.metadata.client_id,
-    // The CHECK pairs this with assistant_public; ticket 41 already refused
-    // any document declaring anything else.
     token_endpoint_auth_method: 'none',
     display_name: resolved.metadata.display_name,
     redirect_uris: resolved.metadata.redirect_uris,
@@ -329,8 +204,6 @@ const startAuthorization = async (query = {}, deps = {}) => {
         .insert([{ ...clientRow, client_type: 'assistant_public' }]);
 
       if (insertError) {
-        // 23505 = the client_id primary key is occupied. That is ALL it means;
-        // it does not say by whom. See the note above.
         if (insertError.code !== '23505') {
           return redirectFailure('server_error', 'client_write_failed');
         }
@@ -338,13 +211,10 @@ const startAuthorization = async (query = {}, deps = {}) => {
         const { data: retried, error: retryError } = await updateAssistantRow();
         if (retryError) return redirectFailure('server_error', 'client_write_failed');
 
-        // Still nothing to update, so the occupying row is not an assistant
-        // client. Now the conflict is established rather than assumed.
+        // Retry still empty → occupant is not assistant_public.
         if (!matchedARow(retried)) {
           return redirectFailure('server_error', 'client_conflicts_with_non_assistant_row');
         }
-        // Otherwise a concurrent first-sight insert won the race and the row
-        // it created is one of ours. Carry on.
       }
     }
   } catch (err) {
@@ -357,9 +227,7 @@ const startAuthorization = async (query = {}, deps = {}) => {
   try {
     const { error } = await db.from('oauth_authorization_transactions').insert([
       {
-        // The hash, never the reference. A dump of this table yields nothing
-        // a browser could present.
-        transaction_hash: hashTransactionReference(reference),
+        transaction_hash: hashTransactionReference(reference), // hash, never the ref
         client_id: resolved.metadata.client_id,
         client_type: 'assistant_public',
         redirect_uri: redirectUri,
@@ -368,11 +236,8 @@ const startAuthorization = async (query = {}, deps = {}) => {
         code_challenge: codeChallenge,
         code_challenge_method: 'S256',
         state,
-        // Ticket 37 mints the CSRF token when it renders the consent summary.
-        csrf_token_hash: null,
-        // Set atomically at approval, never here: the two CHECK constraints in
-        // migration 002 read these three together.
-        bound_user_id: null,
+        csrf_token_hash: null, // ticket 37
+        bound_user_id: null, // set atomically at approval with consumed/decision
         consumed_at: null,
         decision: null,
         expires_at: expiresAt,

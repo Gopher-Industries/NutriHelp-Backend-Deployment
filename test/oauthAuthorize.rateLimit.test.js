@@ -7,6 +7,7 @@ const { expect } = require('chai');
 const express = require('express');
 const request = require('supertest');
 
+const { makeDb } = require('./helpers/oauthClientsDouble');
 const oauthRateLimiters = require('../middleware/oauthRateLimiters');
 const { createOauthRouter } = require('../routes/oauth');
 
@@ -46,12 +47,13 @@ const validQuery = (overrides = {}) => ({
   ...overrides,
 });
 
-const passthroughDb = () => ({
-  from: () => ({
-    insert: async (rows) => ({ data: rows, error: null }),
-    upsert: async (rows) => ({ data: rows, error: null }),
-  }),
-});
+// The SHARED double. The local one this replaces still offered `upsert` — an
+// API the service abandoned when the conditional client write landed — and
+// offered no `update`, so every "allowed" request in this file was actually
+// dying in the try/catch and redirecting server_error to the client. The rate
+// assertions were unaffected (an error redirect is still not a 429), but the
+// file read as though allowed requests reached the frontend, and they did not.
+const passthroughDb = () => makeDb();
 
 const silentLog = () => ({
   logOperational: async () => undefined,
@@ -142,6 +144,24 @@ describe('ticket 45 — rate limits on the authorize and metadata-fetch paths', 
       const servicePerMinute =
         oauthRateLimiters.MCP_SERVICE_MAX / (oauthRateLimiters.MCP_SERVICE_WINDOW_MS / 60000);
       expect(servicePerMinute).to.be.above(1000 / 15);
+    });
+  });
+
+  describe('what "allowed" means in this file', () => {
+    it('an allowed request reaches the FRONTEND, not an error redirect', async () => {
+      // Not merely "not 429". This suite's whole vocabulary is allowed-vs-
+      // limited, so it has to pin what an allowed request actually does —
+      // otherwise a broken double makes every request fail identically and
+      // every rate assertion still passes.
+      const app = makeApp();
+
+      const res = await get(app, { ip: '203.0.113.1' });
+
+      expect(res.status).to.equal(302);
+      const location = new URL(res.headers.location);
+      expect(location.origin).to.equal(FRONTEND_ORIGIN);
+      expect(location.pathname).to.equal('/login');
+      expect([...location.searchParams.keys()]).to.deep.equal(['transaction']);
     });
   });
 

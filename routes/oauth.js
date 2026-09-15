@@ -30,17 +30,8 @@ const createOauthRouter = (deps = {}) => {
   const limiters = deps.oauthRateLimiters || defaultOauthRateLimiters;
   const router = express.Router();
 
-  // Ticket 36 authorize, with ticket 45's buckets in front of it — a merge
-  // gate, not a follow-up. The browser arrives with NO credential (the web app
-  // holds its platform token in browser storage and there is no login cookie),
-  // so there is deliberately no auth middleware here and nothing to infer.
-  //
-  // Both buckets run, in this order, and neither is redundant:
-  //   authorizeAddressLimiter      one host spraying many victim URLs
-  //   metadataFetchClientLimiter   many hosts converging on one victim URL
-  //
-  // They sit BEFORE the handler because the outbound CIMD fetch is the thing
-  // being bounded — a 429 that still fetched would have missed the point.
+  // Ticket 36 + 45: anonymous; address + hostname buckets before CIMD fetch.
+  // No auth middleware — browser arrives with nothing to infer.
   const authorizeController = deps.oauthAuthorizeController || oauthAuthorizeController;
 
   router.get(
@@ -55,13 +46,7 @@ const createOauthRouter = (deps = {}) => {
     ? controller.createIntrospectController(deps)
     : (req, res) => controller.introspect(req, res, deps);
 
-  // No rate limiter here. /introspect and /token are limited by
-  // mcpServiceAddressLimiter mounted in server.js, ABOVE the global limiter
-  // and above the 50mb parsers — this router mounts only when
-  // OAUTH_ROUTES_ENABLED === 'true', so a bucket placed here would vanish in
-  // exactly the deployment where the global limiter has already stepped aside.
-  // Mounting it here as well would also share one store across two mounts and
-  // halve the budget. See the block above app.use(limiter) in server.js.
+  // MCP service rate limit lives in server.js (see oauthRateLimiters.MCP_SERVICE_PATHS).
   router.post(
     '/introspect',
     express.urlencoded({ extended: false, limit: '16kb' }),
