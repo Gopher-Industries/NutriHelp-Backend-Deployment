@@ -29,6 +29,7 @@ const cors = require('cors');
 const swaggerUi = require('swagger-ui-express');
 const yaml = require('yamljs');
 const rateLimit = require('express-rate-limit');
+const oauthRateLimiters = require('./middleware/oauthRateLimiters');
 
 const uploadRoutes = require('./routes/uploadRoutes');
 const systemRoutes = require('./routes/systemRoutes');
@@ -149,12 +150,50 @@ app.use(helmet({
   referrerPolicy: { policy: 'strict-origin-when-cross-origin' },
 }));
 
+// Ticket 45. MUST be mounted here, above the global limiter and ABOVE the
+// 50mb parsers below, and it must be UNCONDITIONAL.
+//
+// Both properties are load-bearing, and the obvious placements break:
+//
+//   Inside routes/oauth.js, the router mounts only when
+//   OAUTH_ROUTES_ENABLED === 'true' (routes/index.js). The `skip` below is
+//   unconditional, so with the flag off — production today — the global bucket
+//   would step aside for a replacement that never mounts, leaving these paths
+//   completely unlimited on the way to a 404.
+//
+//   Below the parsers, a flood is body-parsed at 50mb before being refused.
+//   The limiter has to answer 429 before the request body is read.
+//
+// Mounted ON the same constant the skip is derived from, so the limited set
+// and the skipped set cannot drift into two hand-maintained lists. Express
+// matches app.use paths by prefix while isMcpServicePath matches exactly:
+// that asymmetry is deliberate and safe in this direction — a sub-path is
+// limited by BOTH buckets rather than by neither.
+//
+// This is the only mount. routes/oauth.js deliberately does not mount it
+// again: a second mount sharing this store would halve the effective budget
+// from 6000 to 3000 per window.
+app.use(oauthRateLimiters.MCP_SERVICE_PATHS, oauthRateLimiters.mcpServiceAddressLimiter);
+
 const limiter = rateLimit({
   windowMs: 15 * 60 * 1000,
   max: 1000,
   standardHeaders: true,
   legacyHeaders: false,
   message: { status: 429, error: 'Too many requests, please try again later.' },
+  // Ticket 45. This bucket is keyed per address, and the MCP server reaches
+  // introspect/token from ONE Render egress address on behalf of every
+  // assistant user — the whole population arrives looking like a single busy
+  // IP, and 1000/15min is ~1.1 req/s. Left in place, flipping
+  // OAUTH_ROUTES_ENABLED breaks live introspection.
+  //
+  // Skipping is safe ONLY because of the unconditional mount directly above,
+  // which applies whether or not the oauth router is mounted. Move or
+  // condition that mount and these paths become unlimited.
+  //
+  // GET /api/oauth/authorize is deliberately NOT skipped — it keeps this
+  // bucket AND gains two tighter ones.
+  skip: oauthRateLimiters.isMcpServicePath,
 });
 app.use(limiter);
 

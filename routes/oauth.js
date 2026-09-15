@@ -3,13 +3,16 @@ const express = require('express');
 const oauthIntrospectController = require('../controller/oauthIntrospectController');
 const oauthGrantsController = require('../controller/oauthGrantsController');
 const oauthTokenController = require('../controller/oauthTokenController');
+const oauthAuthorizeController = require('../controller/oauthAuthorizeController');
 const { authenticateToken } = require('../middleware/authenticateToken');
 const { requireExactOrigin } = require('../middleware/requireExactOrigin');
+const defaultOauthRateLimiters = require('../middleware/oauthRateLimiters');
 
 /**
  * OAuth authorization-server routes.
  *
  * Middleware per route — never router-wide:
+ *   GET  /authorize         anonymous; two rate buckets, no auth of any kind
  *   POST /introspect        private_key_jwt; no Origin
  *   POST /token             client auth is grant-specific (exchange needs
  *                           private_key_jwt; 39b auth_code is public+PKCE)
@@ -24,13 +27,41 @@ const { requireExactOrigin } = require('../middleware/requireExactOrigin');
  */
 const createOauthRouter = (deps = {}) => {
   const controller = deps.oauthIntrospectController || oauthIntrospectController;
+  const limiters = deps.oauthRateLimiters || defaultOauthRateLimiters;
   const router = express.Router();
+
+  // Ticket 36 authorize, with ticket 45's buckets in front of it — a merge
+  // gate, not a follow-up. The browser arrives with NO credential (the web app
+  // holds its platform token in browser storage and there is no login cookie),
+  // so there is deliberately no auth middleware here and nothing to infer.
+  //
+  // Both buckets run, in this order, and neither is redundant:
+  //   authorizeAddressLimiter      one host spraying many victim URLs
+  //   metadataFetchClientLimiter   many hosts converging on one victim URL
+  //
+  // They sit BEFORE the handler because the outbound CIMD fetch is the thing
+  // being bounded — a 429 that still fetched would have missed the point.
+  const authorizeController = deps.oauthAuthorizeController || oauthAuthorizeController;
+
+  router.get(
+    '/authorize',
+    limiters.authorizeAddressLimiter,
+    limiters.metadataFetchClientLimiter,
+    authorizeController.createAuthorizeController(deps)
+  );
 
   // Bind once; do not pass deps as a third handler arg (that is Express `next`).
   const introspectHandler = controller.createIntrospectController
     ? controller.createIntrospectController(deps)
     : (req, res) => controller.introspect(req, res, deps);
 
+  // No rate limiter here. /introspect and /token are limited by
+  // mcpServiceAddressLimiter mounted in server.js, ABOVE the global limiter
+  // and above the 50mb parsers — this router mounts only when
+  // OAUTH_ROUTES_ENABLED === 'true', so a bucket placed here would vanish in
+  // exactly the deployment where the global limiter has already stepped aside.
+  // Mounting it here as well would also share one store across two mounts and
+  // halve the budget. See the block above app.use(limiter) in server.js.
   router.post(
     '/introspect',
     express.urlencoded({ extended: false, limit: '16kb' }),

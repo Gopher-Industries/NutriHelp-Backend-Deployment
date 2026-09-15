@@ -23,8 +23,13 @@ const { createOauthRouter } = require('../routes/oauth');
  * Bare-express endpoint tests miss that the router’s 16kb urlencoded is a
  * no-op once server.js has parsed at 50mb and set req._body.
  *
- * Global per-IP limiter (~1.1 req/s shared MCP egress) is NOT fixed here —
- * owned by ticket 45. Settle before OAUTH_ROUTES_ENABLED=true in any deploy.
+ * Global per-IP limiter (~1.1 req/s shared MCP egress): SETTLED by ticket 45,
+ * in this file — see the "MCP service paths are limited in server.js
+ * composition order" describe at the bottom. It used to say the opposite, and
+ * to name a standing gate ("settle before OAUTH_ROUTES_ENABLED=true in any
+ * deploy") that is now met: the service paths carry their own bucket, mounted
+ * unconditionally at app level above both the global limiter and the parsers.
+ * That gate is CLOSED — do not re-raise it or hold a deploy on it.
  */
 
 const MCP_ACCESS_TOKEN_ISSUER = 'https://api.nutrihelp.test';
@@ -152,25 +157,27 @@ const makeDb = ({ grant = ACTIVE_GRANT, seenJtis = new Set() } = {}) => ({
 });
 
 /** Mirrors server.js's ordering for the middleware that touches this route. */
+const makeCompositionDeps = (dbOptions = {}) => ({
+  supabase: makeDb(dbOptions),
+  asVerificationKeys: {
+    getVerificationKeys: () => [{ kid: 'as-key-1', alg: 'RS256', publicKeyPem: asPem.public }],
+  },
+  oauthConfig: {
+    mcpAccessTokenIssuer: () => MCP_ACCESS_TOKEN_ISSUER,
+    mcpResourceIdentifier: () => MCP_RESOURCE,
+    introspectionAudience: () => INTROSPECTION_URL,
+  },
+  introspectionLog: { logOperational: async () => {}, logGrantRefusal: async () => {} },
+});
+
 const makeProductionShapedApp = (dbOptions = {}) => {
-  const deps = {
-    supabase: makeDb(dbOptions),
-    asVerificationKeys: {
-      getVerificationKeys: () => [{ kid: 'as-key-1', alg: 'RS256', publicKeyPem: asPem.public }],
-    },
-    oauthConfig: {
-      mcpAccessTokenIssuer: () => MCP_ACCESS_TOKEN_ISSUER,
-      mcpResourceIdentifier: () => MCP_RESOURCE,
-      introspectionAudience: () => INTROSPECTION_URL,
-    },
-    introspectionLog: { logOperational: async () => {}, logGrantRefusal: async () => {} },
-  };
+  const deps = makeCompositionDeps(dbOptions);
 
   const app = express();
-  app.use(responseContractMiddleware); // server.js:90
-  app.use(express.json({ limit: '50mb' })); // server.js:176
-  app.use(express.urlencoded({ limit: '50mb', extended: true })); // server.js:177
-  app.use('/api/oauth', createOauthRouter(deps)); // via routesRegistrar, server.js:205-206
+  app.use(responseContractMiddleware); // server.js: app.use(responseContractMiddleware)
+  app.use(express.json({ limit: '50mb' })); // server.js: express.json
+  app.use(express.urlencoded({ limit: '50mb', extended: true })); // server.js: express.urlencoded
+  app.use('/api/oauth', createOauthRouter(deps)); // server.js: routesRegistrar(app)
   return app;
 };
 
@@ -452,5 +459,303 @@ describe('POST /api/oauth/introspect — assembled as server.js assembles it', (
       // The message can carry caller-influenced content; only the name travels.
       expect(JSON.stringify(seen)).to.not.contain('hunter2');
     });
+  });
+});
+
+/**
+ * Ticket 45 — the global limiter's `skip` and its replacement, assembled in
+ * server.js's real order.
+ *
+ * The header at the top of this file used to say the global limiter was "NOT
+ * fixed here — owned by ticket 45. Settle before OAUTH_ROUTES_ENABLED=true in
+ * any deploy." This is that settlement, tested where that note lives.
+ *
+ * The bug these cases exist to catch: server.js's `skip` is unconditional,
+ * but routes/index.js mounts the oauth router only when OAUTH_ROUTES_ENABLED
+ * === 'true'. Put the replacement bucket inside the router and, with the flag
+ * off, the global limiter steps aside for something that never mounts and the
+ * MCP service paths become completely unlimited. So the mount must be at app
+ * level, unconditional, and above the 50mb parsers.
+ */
+describe('ticket 45 — the MCP service paths are limited in server.js composition order', () => {
+  const { rateLimit, ipKeyGenerator, MemoryStore } = require('express-rate-limit');
+  const oauthRateLimiters = require('../middleware/oauthRateLimiters');
+
+  const FLOOD_LIMIT = 3;
+
+  /**
+   * Assembled exactly as server.js does, including the two things that make
+   * this bug possible: the unconditional skip, and the 50mb parsers sitting
+   * BELOW the limiters.
+   *
+   * @param routerMounted  false models OAUTH_ROUTES_ENABLED !== 'true'
+   */
+  const makeServerOrderApp = ({
+    routerMounted,
+    serviceLimiter,
+    globalLimit = 1000,
+    // Models the DEFECT: mount the service bucket below the parsers instead of
+    // above them. The ordering case below runs both arms, because a case that
+    // cannot fail in the broken arm is not evidence of anything.
+    serviceLimiterBelowParsers = false,
+  }) => {
+    const app = express();
+    app.set('trust proxy', 1);
+    const probe = { parserRan: false };
+
+    // server.js: app.use(MCP_SERVICE_PATHS, mcpServiceAddressLimiter)
+    if (!serviceLimiterBelowParsers) {
+      app.use(oauthRateLimiters.MCP_SERVICE_PATHS, serviceLimiter);
+    }
+
+    // server.js: the global limiter, with its unconditional skip.
+    app.use(
+      rateLimit({
+        windowMs: 15 * 60 * 1000,
+        limit: globalLimit,
+        standardHeaders: true,
+        legacyHeaders: false,
+        store: new MemoryStore(),
+        keyGenerator: (req) => ipKeyGenerator(req.ip),
+        skip: oauthRateLimiters.isMcpServicePath,
+      })
+    );
+
+    // server.js: app.use(express.json({ limit: '50mb' })) and the urlencoded
+    // sibling, BELOW the limiters — that ordering is the point. Wrapped so a
+    // test can assert the parser never ran, rather than inferring it from a
+    // status code both arms produce.
+    const json50 = express.json({ limit: '50mb' });
+    const urlencoded50 = express.urlencoded({ limit: '50mb', extended: true });
+    app.use((req, res, next) => {
+      probe.parserRan = true;
+      json50(req, res, next);
+    });
+    app.use(urlencoded50);
+
+    if (serviceLimiterBelowParsers) {
+      app.use(oauthRateLimiters.MCP_SERVICE_PATHS, serviceLimiter);
+    }
+
+    if (routerMounted) app.use('/api/oauth', createOauthRouter(makeCompositionDeps()));
+    app.probe = probe;
+    return app;
+  };
+
+  const flood = async (app, path, times, ip) => {
+    let last;
+    for (let i = 0; i < times; i += 1) {
+      last = await request(app).post(path).type('form').set('X-Forwarded-For', ip).send({});
+    }
+    return last;
+  };
+
+  // Derived from the constant, never a second hand-maintained list: adding an
+  // entry to MCP_SERVICE_PATHS without mounting it fails here.
+  oauthRateLimiters.MCP_SERVICE_PATHS.forEach((servicePath) => {
+    it(`refuses a flood on ${servicePath} with the router MOUNTED`, async () => {
+      const app = makeServerOrderApp({
+        routerMounted: true,
+        serviceLimiter: oauthRateLimiters.createMcpServiceLimiter({ limit: FLOOD_LIMIT }),
+      });
+
+      const res = await flood(app, servicePath, FLOOD_LIMIT + 1, '203.0.113.90');
+
+      expect(res.status).to.equal(429);
+    });
+
+    it(`refuses a flood on ${servicePath} with the router NOT mounted (flag off)`, async () => {
+      // This is the case the router-level mount could not cover: with the flag
+      // off the request 404s, but it must be counted and refused on the way
+      // there rather than running cors/helmet/parsers unlimited.
+      const app = makeServerOrderApp({
+        routerMounted: false,
+        serviceLimiter: oauthRateLimiters.createMcpServiceLimiter({ limit: FLOOD_LIMIT }),
+      });
+
+      const before = await flood(app, servicePath, FLOOD_LIMIT, '203.0.113.91');
+      expect(before.status).to.equal(404);
+
+      const res = await request(app)
+        .post(servicePath)
+        .type('form')
+        .set('X-Forwarded-For', '203.0.113.91')
+        .send({});
+
+      expect(res.status).to.equal(429);
+    });
+
+    it(`counts ${servicePath} against the REAL bucket, not just a test one`, async () => {
+      // The flood cases above use a small-limit instance. This one proves the
+      // instance server.js actually mounts is engaged on this path.
+      const app = makeServerOrderApp({
+        routerMounted: false,
+        serviceLimiter: oauthRateLimiters.mcpServiceAddressLimiter,
+      });
+
+      const res = await request(app)
+        .post(servicePath)
+        .type('form')
+        .set('X-Forwarded-For', '203.0.113.92')
+        .send({});
+
+      expect(res.headers['ratelimit-limit']).to.equal(String(oauthRateLimiters.MCP_SERVICE_MAX));
+    });
+  });
+
+  it('refuses the flood BEFORE the 50mb body parser reads the request', async () => {
+    // Ordering, not just presence: a limiter below the parsers accepts an
+    // unbounded body and only then answers 429.
+    const app = makeServerOrderApp({
+      routerMounted: true,
+      serviceLimiter: oauthRateLimiters.createMcpServiceLimiter({ limit: FLOOD_LIMIT }),
+    });
+    const ip = '203.0.113.93';
+
+    await flood(app, '/api/oauth/introspect', FLOOD_LIMIT, ip);
+
+    // Assert the PARSER NEVER RAN, not the status code. 200 kB is far under
+    // the 50mb cap, so a limiter mounted BELOW the parsers answers 429 too —
+    // the status is identical in both arms and separates nothing. Only "the
+    // body was never read" distinguishes them.
+    app.probe.parserRan = false;
+    const res = await request(app)
+      .post('/api/oauth/introspect')
+      .type('form')
+      .set('X-Forwarded-For', ip)
+      .send({ token: 'x'.repeat(200000) });
+
+    expect(res.status).to.equal(429);
+    expect(app.probe.parserRan, 'the 429 must be answered above the body parser').to.equal(false);
+  });
+
+  it('and the same case goes red when the bucket is moved below the parsers', async () => {
+    // The defective arm, run explicitly. Without it, parserRan === false could
+    // be true for some reason unrelated to mount position and the case above
+    // would be another proof that cannot fail — which is the exact defect this
+    // round of review found in its predecessor.
+    const app = makeServerOrderApp({
+      routerMounted: true,
+      serviceLimiter: oauthRateLimiters.createMcpServiceLimiter({ limit: FLOOD_LIMIT }),
+      serviceLimiterBelowParsers: true,
+    });
+    const ip = '203.0.113.94';
+
+    await flood(app, '/api/oauth/introspect', FLOOD_LIMIT, ip);
+
+    app.probe.parserRan = false;
+    const res = await request(app)
+      .post('/api/oauth/introspect')
+      .type('form')
+      .set('X-Forwarded-For', ip)
+      .send({ token: 'x'.repeat(200000) });
+
+    // Identical status — which is precisely why asserting on it proved nothing.
+    expect(res.status).to.equal(429);
+    // Different in the only way that matters: the body was read first.
+    expect(app.probe.parserRan, 'the defective arm must read the body').to.equal(true);
+  });
+
+  it('mounts the service bucket in server.js above the global limiter AND the parsers', () => {
+    // The cases above assemble the app themselves, so they prove the SHAPE of
+    // the fix works — not that server.js uses that shape. This asserts the
+    // real file does, which cannot be observed at runtime without booting the
+    // listener. Middleware order is a source-order property; assert it there.
+    const source = require('fs').readFileSync(path.join(__dirname, '..', 'server.js'), 'utf8');
+
+    const mount = source.indexOf('app.use(oauthRateLimiters.MCP_SERVICE_PATHS');
+    const globalLimiter = source.indexOf('app.use(limiter)');
+    const jsonParser = source.indexOf("app.use(express.json({ limit: '50mb' }))");
+
+    expect(mount, 'server.js must mount the MCP service bucket at app level').to.be.greaterThan(-1);
+    expect(globalLimiter).to.be.greaterThan(-1);
+    expect(jsonParser).to.be.greaterThan(-1);
+
+    // Above the global limiter, or the skip fires with no replacement.
+    expect(mount).to.be.lessThan(globalLimiter);
+    // Above the parsers, or a flood is body-parsed at 50mb before the 429.
+    expect(mount).to.be.lessThan(jsonParser);
+  });
+
+  it('never conditions the MCP service mount on the route flag', () => {
+    // POSITION is what the indexes above pin. C1's root cause was
+    // CONDITIONALITY, and all three of those assertions still hold if someone
+    // wraps the mount in `if (process.env.OAUTH_ROUTES_ENABLED === 'true')`,
+    // which reintroduces the original bug exactly. The flag-off composition
+    // cases cannot catch it either — they build their own app and are handed
+    // the limiter directly.
+    //
+    // Comments are stripped first: server.js legitimately discusses the flag
+    // in prose, and a test that forbids naming a thing forbids documenting it.
+    const source = require('fs').readFileSync(path.join(__dirname, '..', 'server.js'), 'utf8');
+    const code = source.replace(/\/\*[\s\S]*?\*\//g, '').replace(/\/\/.*$/gm, '');
+
+    expect(code, 'the MCP service mount must not be conditioned on the route flag').to.not.contain(
+      'OAUTH_ROUTES_ENABLED'
+    );
+  });
+
+  it('does not put the service bucket back inside the router', () => {
+    // Two mounts sharing one store halve the 6000 budget to 3000, and a
+    // router-level mount is invisible whenever OAUTH_ROUTES_ENABLED is off.
+    //
+    // Matches the BARE NAME after stripping comments, not a USE form. Guarding
+    // `limiters.mcpServiceAddressLimiter` alone missed three spellings,
+    // including `defaultOauthRateLimiters.mcpServiceAddressLimiter` — which is
+    // the name routes/oauth.js already binds the module to, so it is the one
+    // anyone adding a mount there would reach for first.
+    //
+    // Comment-stripping is what lets this be strict: the file documents why
+    // the limiter is deliberately absent, and a test that forbids naming a
+    // thing would forbid documenting it.
+    const source = require('fs').readFileSync(
+      path.join(__dirname, '..', 'routes', 'oauth.js'),
+      'utf8'
+    );
+    const code = source.replace(/\/\*[\s\S]*?\*\//g, '').replace(/\/\/.*$/gm, '');
+
+    expect(code, 'the service bucket must not be re-mounted in the router').to.not.contain(
+      'mcpServiceAddressLimiter'
+    );
+  });
+
+  it('still applies the GLOBAL bucket to a non-service oauth path', async () => {
+    // Exercised, not asserted on the predicate. The claim is that /authorize
+    // stays INSIDE the global bucket — so flood it through the real
+    // composition with the global limit parameterised down, and watch the
+    // global bucket answer. The predicate returning false is the mechanism;
+    // the 429 is the property.
+    const app = makeServerOrderApp({
+      routerMounted: false,
+      serviceLimiter: oauthRateLimiters.createMcpServiceLimiter({ limit: FLOOD_LIMIT }),
+      globalLimit: FLOOD_LIMIT,
+    });
+    const ip = '203.0.113.95';
+
+    for (let i = 0; i < FLOOD_LIMIT; i += 1) {
+      const res = await request(app).get('/api/oauth/authorize').set('X-Forwarded-For', ip);
+      expect(res.status, `request ${i + 1} should not be limited`).to.not.equal(429);
+    }
+    const res = await request(app).get('/api/oauth/authorize').set('X-Forwarded-For', ip);
+
+    expect(res.status).to.equal(429);
+  });
+
+  it('does not spend the global budget on a path that IS skipped', async () => {
+    // The other half of the same claim: a skipped path must not consume the
+    // global bucket, or heavy MCP traffic would exhaust it for everyone else.
+    const app = makeServerOrderApp({
+      routerMounted: false,
+      serviceLimiter: oauthRateLimiters.createMcpServiceLimiter({ limit: 10000 }),
+      globalLimit: FLOOD_LIMIT,
+    });
+    const ip = '203.0.113.96';
+
+    for (let i = 0; i < FLOOD_LIMIT * 3; i += 1) {
+      await request(app).post('/api/oauth/introspect').set('X-Forwarded-For', ip).send({});
+    }
+    const res = await request(app).get('/api/oauth/authorize').set('X-Forwarded-For', ip);
+
+    expect(res.status).to.not.equal(429);
   });
 });
