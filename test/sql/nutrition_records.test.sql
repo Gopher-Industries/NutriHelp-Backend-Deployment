@@ -1,4 +1,10 @@
 \set ON_ERROR_STOP on
+-- from the repository root: npm ci, then npm run test:nutrition-records.
+-- the Node runner creates and closes a fresh in-memory PGlite database for each test;
+-- no PostgreSQL server, Docker, credentials or shared database are needed.
+-- npm test runs Jest only; use the dedicated command above for this SQL suite.
+-- optional native psql execution, after creating an empty database called ticket46_test:
+-- psql -X -v ON_ERROR_STOP=1 -d ticket46_test -f test/sql/nutrition_records.test.sql
 -- run only in an empty, disposable postgres database as a role that can create roles.
 -- the fixture models ticket 14's reported table; it is not a production schema dump.
 
@@ -91,7 +97,7 @@ BEGIN
 END;
 $$;
 
-\ir ../../migrations/alter_nutrition_records.sql
+\ir ../../database/migrations/003_alter_nutrition_records.sql
 
 SELECT pg_temp.assert_true(to_regclass('public.meal_logs') IS NULL, 'no new meal_logs table');
 SELECT pg_temp.assert_true((SELECT relrowsecurity FROM pg_class
@@ -107,7 +113,7 @@ SELECT pg_temp.assert_true(NOT EXISTS (SELECT 1 FROM pg_attrdef d
     'old auth.uid default removed');
 SELECT pg_temp.assert_true((SELECT confrelid = 'public.users'::regclass AND confdeltype = 'c'
     FROM pg_constraint WHERE conrelid = 'public.nutrition_records'::regclass
-    AND conname = 'nutrition_records_user_id_fkey'), 'fk targets app users and retains delete action');
+    AND conname = 'nutrition_records_user_id_fkey'), 'app-user deletion intentionally cascades to meal history');
 SELECT pg_temp.assert_true(NOT EXISTS (
     SELECT * FROM original_nutrition_columns
     EXCEPT
@@ -197,6 +203,7 @@ DELETE FROM public.ingredients WHERE id = 5;
 SELECT pg_temp.assert_true((SELECT food_name = 'Porridge' FROM public.nutrition_records WHERE user_id = 1),
     'food_name snapshot survives ingredient changes');
 DELETE FROM public.users WHERE user_id = 2;
-SELECT pg_temp.assert_true((SELECT count(*) = 1 FROM public.nutrition_records), 'existing fk delete action retained');
+SELECT pg_temp.assert_true((SELECT count(*) = 1 FROM public.nutrition_records),
+    'account deletion removes its meal history and preserves the other user history');
 
 SELECT 'Ticket 46 nutrition_records regression checks passed' AS result;
