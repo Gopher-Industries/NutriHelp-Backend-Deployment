@@ -22,6 +22,7 @@ const routeGroups = [
       ['/api/recipe', './recipe'],
       ['/api/appointments', './appointment'],
       ['/api/mealplan', './mealplan'],
+      ['/api/meallog', './meallog'],
       ['/api/shopping-list', './shoppingList'],
       ['/api/recommendations', './recommendations'],
       ['/api/filter', './filter'],

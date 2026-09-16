@@ -8,6 +8,7 @@
     "dev": "nodemon server.js",
     "test": "jest --runInBand --detectOpenHandles",
     "test:nutrition-records": "node --test test/sql/nutrition_records.integration.cjs",
+    "test:meallog": "jest --runInBand --runTestsByPath test/mealLog.test.js && node --test test/sql/mealLog.integration.cjs",
     "test:unit": "mocha ./test/unit/**/*.test.js --timeout 5000 --exit",
     "test:contract": "jest ./test/contractTests/ --testTimeout=10000 --forceExit",
     "lint": "eslint . --ext .js --max-warnings=0",

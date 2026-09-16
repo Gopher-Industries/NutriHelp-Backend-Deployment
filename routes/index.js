@@ -17,6 +17,7 @@ module.exports = app => {
     app.use("/api/fooddata", require('./fooddata'));
     app.use("/api/user/preferences", require('./userPreferences'));
     app.use("/api/mealplan", require('./mealplan'));
+    app.use("/api/meallog", require('./meallog'));
     app.use("/api/account", require('./account'));
     app.use('/api/notifications', require('./notifications'));
     app.use('/api/filter', require('./filter'));
