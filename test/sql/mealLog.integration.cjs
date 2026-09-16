@@ -114,11 +114,16 @@ before(async () => {
   const sqlSuite = fs
     .readFileSync(path.join(__dirname, 'nutrition_records.test.sql'), 'utf8')
     .replace(/^\\set .*$/gm, '');
-  const [fixture, assertions] = sqlSuite.split('\\ir ../../migrations/alter_nutrition_records.sql');
+  const [fixture, assertions] = sqlSuite.split(
+    '\\ir ../../database/migrations/003_alter_nutrition_records.sql'
+  );
   assert.ok(assertions);
   await db.exec(fixture);
   await db.exec(
-    fs.readFileSync(path.join(__dirname, '../../migrations/alter_nutrition_records.sql'), 'utf8')
+    fs.readFileSync(
+      path.join(__dirname, '../../database/migrations/003_alter_nutrition_records.sql'),
+      'utf8'
+    )
   );
   // Re-run the unchanged Ticket 46 SQL assertions before exercising the endpoint.
   const results = await db.exec(assertions);
