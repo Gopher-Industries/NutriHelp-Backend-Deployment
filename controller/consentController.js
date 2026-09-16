@@ -5,6 +5,7 @@ async function approve(req, res, next) {
     const result = await consentService.approveConsent({
       userId: req.user.userId,
       transactionId: req.body.transaction_id,
+      csrfToken: req.body.csrf_token,
     });
 
     return res.status(200).json({

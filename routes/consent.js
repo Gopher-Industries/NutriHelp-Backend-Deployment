@@ -1,11 +1,20 @@
 const express = require('express');
 const { authenticateToken } = require('../middleware/authenticateToken');
-const { requireCsrfToken, requireFrontendOrigin, issueCsrfToken } = require('../middleware/csrfProtection');
+const { issueCsrfToken } = require('../middleware/csrfProtection');
+const { requireExactOrigin } = require('../middleware/requireExactOrigin');
 const consentController = require('../controller/consentController');
 
-const router = express.Router();
+const createConsentRouter = (deps = {}) => {
+	const router = express.Router();
+	const authenticate = deps.authenticateToken || authenticateToken;
+	const exactOrigin = (deps.requireExactOrigin || requireExactOrigin)(deps);
+	const controller = deps.consentController || consentController;
 
-router.get('/csrf', authenticateToken, requireFrontendOrigin, issueCsrfToken);
-router.post('/approve', authenticateToken, requireFrontendOrigin, requireCsrfToken, consentController.approve);
+	router.get('/csrf', authenticate, exactOrigin, issueCsrfToken);
+	router.post('/approve', authenticate, exactOrigin, controller.approve);
 
-module.exports = router;
+	return router;
+};
+
+module.exports = createConsentRouter();
+module.exports.createConsentRouter = createConsentRouter;

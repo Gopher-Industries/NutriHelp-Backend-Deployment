@@ -151,9 +151,10 @@ Common optional values:
 - `FROM_EMAIL`
 - `NODE_ENV`
 - `CORS_ORIGIN`
-- `FRONTEND_ORIGIN` (required in production; the exact browser origin allowed for credentialed requests)
+- `FRONTEND_ORIGIN` (required in production; the origin allowed by global CORS for browser API requests)
+- `OAUTH_FRONTEND_ORIGIN` (required for OAuth consent routes; exact origin checked by `requireExactOrigin`)
 
-The consent approval endpoint also requires the ticket-35 OAuth migration and ticket-36 authorize flow. Apply `database/migrations/003_add_oauth_consent_approval.sql` only after those tables exist; this repository does not create the OAuth tables or authorize transactions.
+The consent approval endpoint also requires the ticket-35 OAuth migration and ticket-36 authorize flow. This repository has no migration runner: apply the SQL files by hand in dependency order, and apply `database/migrations/004_add_oauth_consent_approval.sql` only after the OAuth tables and `csrf_token_hash` column exist. The repository does not create the OAuth tables or authorize transactions automatically.
 
 ### 4. Start the backend
 

@@ -37,6 +37,7 @@ const MAX_STATE_LENGTH = 512;
 
 /** 32 bytes — the reference must not be cheaper to guess than the code. */
 const REFERENCE_BYTES = 32;
+const CSRF_TOKEN_BYTES = 32;
 
 const AUTHORIZE_ENDPOINT = 'GET /api/oauth/authorize';
 const AUTHORIZE_ERROR_PREFIX = 'oauth_authorize';
@@ -65,6 +66,7 @@ const hashTransactionReference = (reference) =>
   crypto.createHash('sha256').update(reference).digest('hex');
 
 const newTransactionReference = () => crypto.randomBytes(REFERENCE_BYTES).toString('base64url');
+const newCsrfToken = () => crypto.randomBytes(CSRF_TOKEN_BYTES).toString('base64url');
 
 /**
  * Single query value only — Express arrays on repeated keys; taking the first
@@ -222,6 +224,7 @@ const startAuthorization = async (query = {}, deps = {}) => {
   }
 
   const reference = newTransactionReference();
+  const csrfToken = newCsrfToken();
   const expiresAt = new Date(Date.now() + TRANSACTION_TTL_SECONDS * 1000).toISOString();
 
   try {
@@ -236,7 +239,7 @@ const startAuthorization = async (query = {}, deps = {}) => {
         code_challenge: codeChallenge,
         code_challenge_method: 'S256',
         state,
-        csrf_token_hash: null, // ticket 37
+        csrf_token_hash: hashTransactionReference(csrfToken),
         bound_user_id: null, // set atomically at approval with consumed/decision
         consumed_at: null,
         decision: null,
@@ -251,6 +254,7 @@ const startAuthorization = async (query = {}, deps = {}) => {
   return {
     ok: true,
     transactionReference: reference,
+    csrfToken,
     expiresAt,
     clientId: resolved.metadata.client_id,
     redirectUri,

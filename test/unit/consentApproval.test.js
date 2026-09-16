@@ -1,11 +1,9 @@
 const crypto = require('crypto');
 const { expect } = require('chai');
 const sinon = require('sinon');
-const proxyquire = require('proxyquire').noCallThru();
-const {
-  requireCsrfToken,
-  requireFrontendOrigin,
-} = require('../../middleware/csrfProtection');
+const { approveConsent } = require('../../services/consentService');
+const { requireCsrfToken } = require('../../middleware/csrfProtection');
+const { requireExactOrigin } = require('../../middleware/requireExactOrigin');
 
 describe('consent approval', () => {
   afterEach(() => sinon.restore());
@@ -21,13 +19,11 @@ describe('consent approval', () => {
       },
       error: null,
     });
-    const service = proxyquire('../../services/consentService', {
-      './supabaseClient': { getSupabaseServiceClient: () => ({ rpc }) },
-    });
-
-    const result = await service.approveConsent({
+    const result = await approveConsent({
       userId: 42,
       transactionId: 'transaction-1',
+      csrfToken: 'csrf-token-1',
+      supabase: { rpc },
     });
 
     expect(rpc.calledOnce).to.equal(true);
@@ -35,6 +31,7 @@ describe('consent approval', () => {
     expect(rpc.firstCall.args[1]).to.deep.equal({
       p_transaction_hash: crypto.createHash('sha256').update('transaction-1').digest('hex'),
       p_user_id: 42,
+      p_csrf_token: 'csrf-token-1',
     });
     expect(result).to.deep.equal({
       authorizationCode: 'one-time-code',
@@ -45,16 +42,15 @@ describe('consent approval', () => {
   });
 
   it('rejects a replay reported by the atomic OAuth operation', async () => {
-    const service = proxyquire('../../services/consentService', {
-      './supabaseClient': {
-        getSupabaseServiceClient: () => ({
-          rpc: sinon.stub().resolves({ data: { status: 'already_used' }, error: null }),
-        }),
-      },
-    });
-
     try {
-      await service.approveConsent({ userId: 42, transactionId: 'transaction-1' });
+      await approveConsent({
+        userId: 42,
+        transactionId: 'transaction-1',
+        csrfToken: 'csrf-token-1',
+        supabase: {
+          rpc: sinon.stub().resolves({ data: { status: 'already_used' }, error: null }),
+        },
+      });
       throw new Error('Expected replay to be rejected');
     } catch (error) {
       expect(error.status).to.equal(409);
@@ -63,16 +59,15 @@ describe('consent approval', () => {
   });
 
   it('fails closed when the OAuth schema operation is not installed', async () => {
-    const service = proxyquire('../../services/consentService', {
-      './supabaseClient': {
-        getSupabaseServiceClient: () => ({
-          rpc: sinon.stub().resolves({ error: { code: '42883' } }),
-        }),
-      },
-    });
-
     try {
-      await service.approveConsent({ userId: 42, transactionId: 'transaction-1' });
+      await approveConsent({
+        userId: 42,
+        transactionId: 'transaction-1',
+        csrfToken: 'csrf-token-1',
+        supabase: {
+          rpc: sinon.stub().resolves({ error: { code: '42883' } }),
+        },
+      });
       throw new Error('Expected missing OAuth operation to be rejected');
     } catch (error) {
       expect(error.status).to.equal(503);
@@ -81,15 +76,20 @@ describe('consent approval', () => {
 
   it('requires the exact production frontend origin', () => {
     const previousEnvironment = process.env.NODE_ENV;
-    const previousOrigin = process.env.FRONTEND_ORIGIN;
+    const previousOrigin = process.env.OAUTH_FRONTEND_ORIGIN;
     process.env.NODE_ENV = 'production';
-    process.env.FRONTEND_ORIGIN = 'https://app.nutrihelp.example';
+    process.env.OAUTH_FRONTEND_ORIGIN = 'https://app.nutrihelp.example';
+    const requireOrigin = requireExactOrigin();
 
     const rejected = {
       status: sinon.stub().returnsThis(),
       json: sinon.stub().returnsThis(),
     };
-    requireFrontendOrigin({ headers: { origin: 'https://preview.nutrihelp.example' } }, rejected, sinon.stub());
+    requireOrigin(
+      { get: (header) => (header === 'origin' ? 'https://preview.nutrihelp.example' : undefined) },
+      rejected,
+      sinon.stub()
+    );
     expect(rejected.status.calledWith(403)).to.equal(true);
 
     const accepted = {
@@ -97,11 +97,29 @@ describe('consent approval', () => {
       json: sinon.stub().returnsThis(),
     };
     const next = sinon.stub();
-    requireFrontendOrigin({ headers: { origin: 'https://app.nutrihelp.example' } }, accepted, next);
+    requireOrigin(
+      { get: (header) => (header === 'origin' ? 'https://app.nutrihelp.example' : undefined) },
+      accepted,
+      next
+    );
     expect(next.calledOnce).to.equal(true);
 
+    const absentOrigin = {
+      status: sinon.stub().returnsThis(),
+      json: sinon.stub().returnsThis(),
+    };
+    requireOrigin({ get: () => undefined }, absentOrigin, sinon.stub());
+    expect(absentOrigin.status.calledWith(403)).to.equal(true);
+
+    const nullOrigin = {
+      status: sinon.stub().returnsThis(),
+      json: sinon.stub().returnsThis(),
+    };
+    requireOrigin({ get: () => 'null' }, nullOrigin, sinon.stub());
+    expect(nullOrigin.status.calledWith(403)).to.equal(true);
+
     process.env.NODE_ENV = previousEnvironment;
-    process.env.FRONTEND_ORIGIN = previousOrigin;
+    process.env.OAUTH_FRONTEND_ORIGIN = previousOrigin;
   });
 
   it('requires the CSRF header to match the consent cookie', () => {
@@ -121,5 +139,18 @@ describe('consent approval', () => {
     };
     requireCsrfToken({ headers: { 'x-csrf-token': 'wrong', cookie: 'nutrihelp_csrf=csrf-value' } }, rejected, sinon.stub());
     expect(rejected.status.calledWith(403)).to.equal(true);
+
+    const malformed = {
+      status: sinon.stub().returnsThis(),
+      json: sinon.stub().returnsThis(),
+    };
+    expect(() =>
+      requireCsrfToken(
+        { headers: { 'x-csrf-token': 'abé', cookie: 'nutrihelp_csrf=abc' } },
+        malformed,
+        sinon.stub()
+      )
+    ).to.not.throw();
+    expect(malformed.status.calledWith(403)).to.equal(true);
   });
 });

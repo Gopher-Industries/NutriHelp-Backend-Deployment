@@ -7,9 +7,12 @@
 
 create extension if not exists pgcrypto;
 
+drop function if exists public.approve_oauth_authorization(text, bigint);
+
 create or replace function public.approve_oauth_authorization(
   p_transaction_hash text,
-  p_user_id bigint
+  p_user_id bigint,
+  p_csrf_token text
 )
 returns jsonb
 language plpgsql
@@ -27,6 +30,12 @@ begin
   for update;
 
   if not found then
+    return jsonb_build_object('status', 'invalid');
+  end if;
+
+  if p_csrf_token is null
+     or authorization_transaction.csrf_token_hash is null
+     or authorization_transaction.csrf_token_hash <> encode(digest(p_csrf_token, 'sha256'), 'hex') then
     return jsonb_build_object('status', 'invalid');
   end if;
 
@@ -89,5 +98,5 @@ begin
 end;
 $$;
 
-revoke all on function public.approve_oauth_authorization(text, bigint) from public;
-grant execute on function public.approve_oauth_authorization(text, bigint) to service_role;
+revoke all on function public.approve_oauth_authorization(text, bigint, text) from public;
+grant execute on function public.approve_oauth_authorization(text, bigint, text) to service_role;

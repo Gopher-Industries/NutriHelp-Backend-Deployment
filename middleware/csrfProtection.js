@@ -46,9 +46,11 @@ function issueCsrfToken(_req, res) {
 function requireCsrfToken(req, res, next) {
   const headerToken = req.headers[HEADER_NAME];
   const cookieToken = getCookie(req, COOKIE_NAME);
+  const headerBuffer = headerToken ? Buffer.from(headerToken) : null;
+  const cookieBuffer = cookieToken ? Buffer.from(cookieToken) : null;
 
-  if (!headerToken || !cookieToken || headerToken.length !== cookieToken.length ||
-      !crypto.timingSafeEqual(Buffer.from(headerToken), Buffer.from(cookieToken))) {
+  if (!headerBuffer || !cookieBuffer || headerBuffer.length !== cookieBuffer.length ||
+      !crypto.timingSafeEqual(headerBuffer, cookieBuffer)) {
     return res.status(403).json({ success: false, error: 'CSRF token missing or invalid' });
   }
 

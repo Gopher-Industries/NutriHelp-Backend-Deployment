@@ -5,14 +5,18 @@ function hashValue(value) {
   return crypto.createHash('sha256').update(String(value)).digest('hex');
 }
 
-async function approveConsent({ userId, transactionId }) {
-  if (!userId || !transactionId) {
-    const error = new Error('transactionId is required');
+async function approveConsent({
+  userId,
+  transactionId,
+  csrfToken,
+  supabase = getSupabaseServiceClient(),
+}) {
+  if (!userId || !transactionId || !csrfToken) {
+    const error = new Error('transactionId and csrfToken are required');
     error.status = 400;
     throw error;
   }
 
-  const supabase = getSupabaseServiceClient();
   if (!supabase) {
     const error = new Error('Supabase service client is not configured');
     error.status = 503;
@@ -22,6 +26,7 @@ async function approveConsent({ userId, transactionId }) {
   const { data, error } = await supabase.rpc('approve_oauth_authorization', {
     p_transaction_hash: hashValue(transactionId),
     p_user_id: userId,
+    p_csrf_token: csrfToken,
   });
 
   if (error) {
