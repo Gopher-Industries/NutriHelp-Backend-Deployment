@@ -4,9 +4,8 @@ const mcpAccessTokenVerifier = require('./mcpAccessTokenVerifier');
 /**
  * RFC 7662 introspection over an MCP access token.
  *
- * active:false means only: verified and genuinely inactive. Never produced by
- * a failed check — that is `unavailable` → 503. Cached positives defeat live
- * revocation; this path never caches.
+ * active:false means verified and genuinely inactive only. A failed check is
+ * `unavailable` → 503. Never caches positives.
  */
 
 const GRANT_STATUS_ACTIVE = 'active';
@@ -84,7 +83,7 @@ const introspect = async (tokenValue, deps = {}) => {
   if (claims.client_id !== grant.client_id) {
     return inactive('token_grant_client_mismatch', grant.user_id, notices);
   }
-  // aud already checked against MCP_RESOURCE_IDENTIFIER; also match this grant's resource.
+  // Match this grant's resource (jwt.verify audience accepts any array element).
   if (claims.aud !== grant.resource) {
     return inactive('token_grant_resource_mismatch', grant.user_id, notices);
   }

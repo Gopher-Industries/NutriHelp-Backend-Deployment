@@ -5,13 +5,12 @@ const securityEventService = require('../securityEventService');
  * Operational vs security sinks. Never log token/assertion values. Logging
  * never fails the request.
  *
- * Event identity (event_type/resource/endpoint) is parameterized, defaulting
- * to introspection so ticket 42 callers stay byte-identical. Disconnect MUST
- * pass its own — those fields are what auditors filter on; metadata.detail
- * does not reach them.
+ * Event identity is parameterized (defaults = introspection) so ticket 42
+ * callers stay byte-identical. Disconnect MUST pass its own — auditors filter
+ * on those fields; metadata.detail does not reach them.
  *
- * Never add a key to additionalContext: oauthIntrospect.endpoint.test.js
- * pins the exact key set (richer context is how `req`/credentials leak in).
+ * Never add a key to additionalContext: oauthIntrospect.endpoint.test.js pins
+ * the exact key set (richer context is how `req`/credentials leak in).
  */
 
 const INTROSPECT_ENDPOINT = 'POST /api/oauth/introspect';

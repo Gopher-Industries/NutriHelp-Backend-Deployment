@@ -1,8 +1,6 @@
 /**
  * OAuth AS config — from environment only, never from the request.
- *
- * Assertion aud (Q16a) must not be derived from Host / hostname; that lets the
- * caller choose the value under check. Unset → null → 503, never active:false.
+ * Assertion aud (Q16a) must not be derived from Host. Unset → null → 503.
  */
 
 const readEnv = (name) => {
@@ -23,7 +21,7 @@ const absoluteEndpointUrl = (variable) => {
   }
 };
 
-/** Absolute introspection URL, normalised as new URL(x).href (same as MCP). */
+/** Absolute introspection URL. */
 const introspectionAudience = () => absoluteEndpointUrl('MCP_INTROSPECTION_URL');
 
 /** Q16a token-endpoint aud. No fallback to introspection URL. Unset → null → 503. */
@@ -37,9 +35,8 @@ const mcpAccessTokenIssuer = () => readEnv('MCP_AS_ISSUER');
 const mcpResourceIdentifier = () => readEnv('MCP_RESOURCE_IDENTIFIER');
 
 /**
- * Exact Origin for user-facing OAuth routes. Literal string only — never a
- * *.vercel.app pattern (server.js CORS has that hole). Null → middleware
- * refuses; unset must never mean accept-anything.
+ * Exact Origin for user-facing OAuth routes. Literal only — never a
+ * *.vercel.app pattern. Null → middleware refuses; unset must never mean accept-anything.
  */
 const frontendOrigin = () => readEnv('OAUTH_FRONTEND_ORIGIN');
 

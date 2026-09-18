@@ -6,20 +6,19 @@ const oauthConfig = require('./oauthConfig');
 /**
  * private_key_jwt (RFC 7523) for the MCP server.
  *
- * Algorithm comes from the registered key row, never the assertion header.
+ * Algorithm from the registered key row, never the assertion header.
  * jsonwebtoken accepts `none` and HS*; Q16c rejects both. If header.alg chose
  * the verify algorithm: `none` is unsigned auth; HS256 treats public_key_pem as
  * the HMAC secret (anyone with the public key forges assertions).
  *
- * Q16b multi-key trial (owned by ticket 40 rotation): while kid is absent, try
- * each in-window active key, capped at two. Schema exclusion guarantees ≤2
- * overlapping windows. Retires when MCP sends kid.
+ * Q16b multi-key trial (ticket 40): while kid is absent, try each in-window
+ * active key, capped at two. Schema exclusion guarantees ≤2 overlapping windows.
  */
 
 const ASSERTION_TYPE = 'urn:ietf:params:oauth:client-assertion-type:jwt-bearer';
 
-// Q16a: one verifier, one absolute URL per endpoint. Default is introspection
-// for ticket 42 call sites; /token must pass AUDIENCE_TOKEN_ENDPOINT explicitly.
+// Q16a: one absolute URL per endpoint. Default is introspection; /token must
+// pass AUDIENCE_TOKEN_ENDPOINT explicitly.
 const AUDIENCE_INTROSPECTION = Object.freeze({
   resolve: (config) => config.introspectionAudience(),
   unconfiguredDetail: 'introspection_audience_unconfigured',
@@ -60,11 +59,10 @@ const safeAlgLabel = (value) => {
  * Sampled, bounded purge of oauth_client_assertion_jti (release gate, mig 002).
  * Never fails the request. Filter on expires_at (lifetime+skew), not created_at.
  *
- * `.order('expires_at', { ascending: true })` is required: PostgREST 12
- * rejects DELETE+limit without order (PGRST109). Measured 2026-09-10 on live
- * 12.2.3 — unordered → 400 every call; ordered → 204. Ascending drains
- * oldest-expired first. expires_at need not be unique here (no pagination
- * cursor). Optional stronger path later: RPC with mig 002's ctid subquery.
+ * `.order('expires_at', { ascending: true })` is required: PostgREST 12 rejects
+ * DELETE+limit without order (PGRST109). Measured 2026-09-10 on live 12.2.3 —
+ * unordered → 400 every call; ordered → 204. Ascending drains oldest-expired
+ * first. expires_at need not be unique (no pagination cursor).
  */
 const purgeExpiredJtis = async (db, random = Math.random) => {
   if (random() >= 1 / JTI_PURGE_SAMPLE_RATE) return { purged: false, sampled: false };
@@ -75,7 +73,6 @@ const purgeExpiredJtis = async (db, random = Math.random) => {
       .from('oauth_client_assertion_jti')
       .delete()
       .lt('expires_at', new Date().toISOString())
-      // Required by PostgREST 12 whenever limit is applied to a DELETE.
       .order('expires_at', { ascending: true })
       .limit(JTI_PURGE_BATCH_SIZE);
 
@@ -258,7 +255,7 @@ const verifyClientAssertion = async (params = {}, deps = {}) => {
 
   const nowSeconds = Math.floor(Date.now() / 1000);
 
-  // exp-iat alone is attacker-chosen and collapses at large magnitudes — also bound to now.
+  // exp-iat alone is attacker-chosen — also bound to now.
   if (exp - iat > MAX_ASSERTION_LIFETIME_SECONDS) {
     return fail(401, 'invalid_client', 'assertion_lifetime_too_long');
   }

@@ -1,10 +1,9 @@
 /**
  * Ticket 40 replaces this file's body only.
- *
  * getVerificationKeys() -> [{ kid, alg, publicKeyPem }]
  *
- * Env-backed today; JWKS/rotation later. Public material only — never sign here
- * (issuance is ticket 39). Empty → unavailable → 503, never active:false.
+ * Env-backed today; JWKS/rotation later. Public material only — never sign here.
+ * Empty → unavailable → 503, never active:false.
  */
 
 const readEnv = (name) => {

@@ -5,12 +5,11 @@ const oauthConfig = require('./oauthConfig');
 
 /**
  * Verifies the MCP access token in the introspection `token` parameter.
- *
- * Algorithm is pinned from the profile (RS256), never from the token header.
+ * Algorithm pinned from the profile (RS256), never from the token header.
  *
  *   {ok: true,  claims}                verified
- *   {ok: false, reason: 'invalid'}     verified-not-valid → active:false
- *   {ok: false, reason: 'unavailable'} could not check → 503, never false
+ *   {ok: false, reason: 'invalid'}     → active:false
+ *   {ok: false, reason: 'unavailable'} → 503, never false
  *
  * Collapsing unavailable into invalid reports the whole platform as revoked
  * when a deploy misses a key env var.
@@ -23,8 +22,8 @@ const REQUIRED_STRING_CLAIMS = ['grant_id', 'sub', 'client_id', 'jti'];
 
 /**
  * jsonwebtoken only checks `exp` when present — a signed token without `exp`
- * verifies and would stay active forever. Require finite iat/exp separately:
- * putting them on the string list would reject every legitimate numeric claim.
+ * verifies forever. Require finite iat/exp separately: the string list would
+ * reject every legitimate numeric claim.
  */
 const REQUIRED_NUMERIC_CLAIMS = ['iat', 'exp'];
 
@@ -60,8 +59,8 @@ const verifyMcpAccessToken = (tokenValue, deps = {}) => {
 
   const candidates = headerKid ? keys.filter((key) => key.kid === headerKid) : keys;
   if (candidates.length === 0) {
-    // No applicable key → unavailable, not invalid. Mis-set KEY_ID or a
-    // rotation window must not mass-disconnect users via cached active:false.
+    // No key → unavailable, not invalid. Mis-set KEY_ID must not mass-disconnect
+    // via cached active:false.
     return { ok: false, reason: 'unavailable', detail: 'no_key_for_kid' };
   }
 
@@ -96,8 +95,8 @@ const verifyMcpAccessToken = (tokenValue, deps = {}) => {
     return { ok: false, reason: 'invalid', detail: `missing_claims:${missing.join(',')}` };
   }
 
-  // Missing scope is a diagnostic, not a refusal: requiring it would yield
-  // active:false (looks like revocation). Empty string is a valid zero-scope grant.
+  // Missing scope is a diagnostic, not a refusal (active:false looks like revocation).
+  // Empty string is a valid zero-scope grant.
   const notices =
     claims.scope === undefined || claims.scope === null ? ['token_missing_scope_claim'] : [];
 

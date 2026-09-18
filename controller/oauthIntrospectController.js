@@ -7,14 +7,14 @@ const introspectionLog = require('../services/oauth/introspectionLog');
 /**
  * POST /api/oauth/introspect — RFC 7662, private_key_jwt.
  *
- * Inactive grant → 200 {"active": false}, NEVER 401. The MCP client maps every
- * non-2xx to retryable upstream_failure, so 401-on-inactive leaves a disconnected
- * user still connected. 401 here means assertion auth failed only.
+ * Inactive → 200 {"active": false}, NEVER 401. MCP maps non-2xx to retryable
+ * upstream_failure, so 401-on-inactive leaves a disconnected user still connected.
+ * 401 means assertion auth failed only.
  *
  *   200  active or inactive
  *   400  malformed request
  *   401  private_key_jwt failed / replayed
- *   503  could not establish an answer (never rendered as active:false)
+ *   503  could not establish an answer (never active:false)
  *
  * Any authenticated service_confidential client may introspect any token
  * (RFC 7662). Safe with one confidential client; a second needs an explicit policy.
@@ -43,7 +43,6 @@ const createIntrospectController = (deps = {}) => {
 
       const body = req.body || {};
 
-      // Authenticate before looking at the token — unauthenticated callers learn nothing.
       const authentication = await assertionVerifier.verifyClientAssertion(body, deps);
 
       if (!authentication.ok) {
@@ -93,7 +92,7 @@ const createIntrospectController = (deps = {}) => {
 
       const result = await service.introspect(token, deps);
 
-      // Diagnostics only — must not change the answer (e.g. missing scope claim).
+      // Diagnostics only — must not change the answer.
       for (const notice of result.notices || []) {
         await log.logOperational(
           {
@@ -108,7 +107,6 @@ const createIntrospectController = (deps = {}) => {
       }
 
       if (result.outcome === 'unavailable') {
-        // Not active:false — we could not establish an answer.
         await log.logOperational(
           {
             ...logContext,
