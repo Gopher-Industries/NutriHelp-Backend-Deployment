@@ -161,7 +161,7 @@ describe('ticket 45 — rate limits on the authorize and metadata-fetch paths', 
       const location = new URL(res.headers.location);
       expect(location.origin).to.equal(FRONTEND_ORIGIN);
       expect(location.pathname).to.equal('/login');
-      expect([...location.searchParams.keys()]).to.deep.equal(['transaction']);
+      expect([...location.searchParams.keys()]).to.deep.equal(['transaction', 'csrf_token']);
     });
   });
 
