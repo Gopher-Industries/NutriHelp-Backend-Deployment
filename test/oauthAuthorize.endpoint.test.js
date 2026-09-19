@@ -126,15 +126,15 @@ describe('GET /api/oauth/authorize — ticket 36', () => {
       expect(new URL(res.headers.location).origin).to.equal(FRONTEND_ORIGIN);
     });
 
-    it('carries ONLY the transaction reference to the frontend', async () => {
+    it('carries only opaque transaction and CSRF values to the frontend', async () => {
       const { app } = makeApp();
 
       const res = await request(app).get('/api/oauth/authorize').query(validQuery());
 
-      // The contract says "carrying only the opaque identifier". A second
-      // parameter here is how request details start leaking into browser
-      // history and Referer.
-      expect([...queryOf(res.headers.location).keys()]).to.deep.equal(['transaction']);
+      expect([...queryOf(res.headers.location).keys()]).to.deep.equal([
+        'transaction',
+        'csrf_token',
+      ]);
     });
 
     it('stores the HASH of the reference, never the reference itself', async () => {
@@ -150,6 +150,22 @@ describe('GET /api/oauth/authorize — ticket 36', () => {
       expect(row.transaction_hash).to.equal(expected);
       expect(row.transaction_hash).to.not.equal(reference);
       expect(JSON.stringify(row)).to.not.contain(reference);
+    });
+
+    it('stores only the hash of the transaction-bound CSRF token', async () => {
+      const db = makeDb();
+      const { app } = makeApp({ db });
+
+      const res = await request(app).get('/api/oauth/authorize').query(validQuery());
+
+      const csrfToken = queryOf(res.headers.location).get('csrf_token');
+      const [row] = db.calls.transactionInserts;
+      const expected = crypto.createHash('sha256').update(csrfToken).digest('hex');
+
+      expect(csrfToken).to.match(/^[A-Za-z0-9_-]{43}$/);
+      expect(row.csrf_token_hash).to.equal(expected);
+      expect(row.csrf_token_hash).to.not.equal(csrfToken);
+      expect(JSON.stringify(row)).to.not.contain(csrfToken);
     });
 
     it('issues a reference with at least 128 bits of entropy', async () => {
@@ -228,16 +244,6 @@ describe('GET /api/oauth/authorize — ticket 36', () => {
       expect(expires - before).to.be.at.least(60 * 1000);
     });
 
-    it('never mints a csrf_token_hash — ticket 37 owns that', async () => {
-      const db = makeDb();
-      const { app } = makeApp({ db });
-
-      await request(app).get('/api/oauth/authorize').query(validQuery());
-
-      const [row] = db.calls.transactionInserts;
-      expect(row.csrf_token_hash === null || row.csrf_token_hash === undefined).to.equal(true);
-    });
-
     it('registers the resolved client so the transaction FK resolves', async () => {
       const db = makeDb();
       const { app } = makeApp({ db });
@@ -288,7 +294,7 @@ describe('GET /api/oauth/authorize — ticket 36', () => {
     });
   });
 
-  describe('no token, ever, in a URL', () => {
+  describe('no platform bearer token in a URL', () => {
     it('ignores an Authorization header rather than putting anything in the redirect', async () => {
       const { app } = makeApp();
 
@@ -302,7 +308,7 @@ describe('GET /api/oauth/authorize — ticket 36', () => {
       expect(res.headers.location).to.not.contain('Bearer');
     });
 
-    it('never writes a bearer token onto the transaction row', async () => {
+      it('never writes a platform bearer token onto the transaction row', async () => {
       const db = makeDb();
       const { app } = makeApp({ db });
 
@@ -786,7 +792,10 @@ describe('GET /api/oauth/authorize — ticket 36', () => {
 
       expect(res.status).to.equal(302);
       expect(new URL(res.headers.location).origin).to.equal(FRONTEND_ORIGIN);
-      expect([...queryOf(res.headers.location).keys()]).to.deep.equal(['transaction']);
+      expect([...queryOf(res.headers.location).keys()]).to.deep.equal([
+        'transaction',
+        'csrf_token',
+      ]);
     });
 
     it('raises NO security event for the race', async () => {
@@ -1192,13 +1201,16 @@ describe('GET /api/oauth/authorize — ticket 36', () => {
       expect(new URL(res.headers.location).searchParams.get('error')).to.equal('server_error');
     });
 
-    it('keeps the single-key guarantee under a configured path', async () => {
+    it('keeps the opaque-value guarantee under a configured path', async () => {
       process.env.OAUTH_FRONTEND_LOGIN_PATH = '/connect/consent';
       const { app } = makeApp();
 
       const res = await request(app).get('/api/oauth/authorize').query(validQuery());
 
-      expect([...queryOf(res.headers.location).keys()]).to.deep.equal(['transaction']);
+      expect([...queryOf(res.headers.location).keys()]).to.deep.equal([
+        'transaction',
+        'csrf_token',
+      ]);
     });
 
     it('refuses a protocol-relative login path', async () => {

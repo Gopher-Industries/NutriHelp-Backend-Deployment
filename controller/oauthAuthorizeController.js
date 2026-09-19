@@ -148,6 +148,7 @@ const createAuthorizeController = (deps = {}) => {
 
         const destination = new URL(base.url.href);
         destination.searchParams.set('transaction', result.transactionReference);
+        destination.searchParams.set('csrf_token', result.csrfToken);
         return res.redirect(302, destination.href);
       }
 
