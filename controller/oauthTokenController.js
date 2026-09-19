@@ -2,19 +2,26 @@ const crypto = require('crypto');
 
 const clientAssertionVerifier = require('../services/oauth/clientAssertionVerifier');
 const tokenExchangeService = require('../services/oauth/tokenExchangeService');
+const authorizationCodeGrantService = require('../services/oauth/authorizationCodeGrantService');
+const refreshTokenGrantService = require('../services/oauth/refreshTokenGrantService');
 const introspectionLog = require('../services/oauth/introspectionLog');
 
 /**
  * POST /api/oauth/token.
  *
- * Inactive grant → 400 invalid_grant here (introspection answers 200 active:false).
+ * Inactive grant → 400 invalid_grant (introspection: 200 active:false).
  * Errors: RFC 6749 §5.2 + invalid_target. Never insufficient_scope/403.
  *
- * 39a: exchange only. 39b adds authorization_code / refresh_token beside it.
- * Unknown grant_type is refused before client auth (avoids consuming a jti).
+ * Grants: exchange (39a), authorization_code + refresh_token (39b).
+ * Unknown grant_type refused before client auth (avoids consuming a jti).
+ *
+ * ⚠️ 39b grants: no client auth (public assistant; PKCE + bindings).
+ * Exchange still requires private_key_jwt.
  */
 
 const EXCHANGE_GRANT_TYPE = 'urn:ietf:params:oauth:grant-type:token-exchange';
+const AUTHORIZATION_CODE_GRANT_TYPE = 'authorization_code';
+const REFRESH_TOKEN_GRANT_TYPE = 'refresh_token';
 const ACCESS_TOKEN_TYPE = 'urn:ietf:params:oauth:token-type:access_token';
 
 const TOKEN_ENDPOINT = 'POST /api/oauth/token';
@@ -137,9 +144,67 @@ const createTokenController = (deps = {}) => {
     });
   };
 
-  const GRANT_HANDLERS = Object.freeze({
-    [EXCHANGE_GRANT_TYPE]: handleTokenExchange,
-  });
+  const codeGrantService = deps.authorizationCodeGrantService || authorizationCodeGrantService;
+  const refreshGrantService = deps.refreshTokenGrantService || refreshTokenGrantService;
+
+  /** Map 39b grant outcomes to HTTP — same shape as exchange. */
+  const respondToGrantResult = async (res, context, result) => {
+    if (result.outcome === 'unavailable') {
+      await logOperational({
+        ...context,
+        outcome: 'grant_unavailable',
+        detail: result.detail,
+        httpStatus: 503,
+      });
+      setNoStore(res);
+      return res.status(503).json({ error: 'server_error' });
+    }
+
+    if (result.outcome === 'refused') {
+      return sendError(
+        res,
+        context,
+        result.error,
+        result.detail,
+        ERROR_STATUS[result.error] || 400
+      );
+    }
+
+    setNoStore(res);
+    return res.status(200).json({
+      access_token: result.accessToken,
+      token_type: 'Bearer',
+      expires_in: result.expiresIn,
+      scope: result.scope,
+      refresh_token: result.refreshToken,
+    });
+  };
+
+  const handleAuthorizationCode = async (req, res, context) => {
+    const body = req.body || {};
+    const withClient = { ...context, clientId: body.client_id };
+    const result = await codeGrantService.redeemAuthorizationCode(body, deps);
+    return respondToGrantResult(res, withClient, result);
+  };
+
+  const handleRefreshToken = async (req, res, context) => {
+    const body = req.body || {};
+    const withClient = { ...context, clientId: body.client_id };
+    const result = await refreshGrantService.rotateRefreshToken(body, deps);
+    return respondToGrantResult(res, withClient, result);
+  };
+
+  /**
+   * ⚠️ Null prototype, not an object literal — grantType is request input;
+   * on a literal, grant_type=constructor is truthy and the handler hangs.
+   */
+  const GRANT_HANDLERS = Object.freeze(
+    Object.assign(Object.create(null), {
+      [EXCHANGE_GRANT_TYPE]: handleTokenExchange,
+      [AUTHORIZATION_CODE_GRANT_TYPE]: handleAuthorizationCode,
+      [REFRESH_TOKEN_GRANT_TYPE]: handleRefreshToken,
+    })
+  );
 
   return async (req, res) => {
     const correlationId = req.get ? req.get('x-correlation-id') : undefined;
@@ -192,6 +257,8 @@ module.exports = {
   token,
   createTokenController,
   EXCHANGE_GRANT_TYPE,
+  AUTHORIZATION_CODE_GRANT_TYPE,
+  REFRESH_TOKEN_GRANT_TYPE,
   TOKEN_ENDPOINT,
   TOKEN_ERROR_PREFIX,
   EXCHANGE_ANOMALY_EVENT,
