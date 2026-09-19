@@ -87,6 +87,12 @@ const verifyMcpAccessToken = (tokenValue, deps = {}) => {
     return { ok: false, reason: 'invalid', detail: 'wrong_token_profile' };
   }
 
+  // aud must be scalar — jwt.verify accepts any array element as audience.
+  // After the key trial so ticket 40's multi-key loop does not re-check per key.
+  if (!isNonEmptyString(claims.aud)) {
+    return { ok: false, reason: 'invalid', detail: 'aud_not_scalar' };
+  }
+
   const missing = [
     ...REQUIRED_STRING_CLAIMS.filter((claim) => !isNonEmptyString(claims[claim])),
     ...REQUIRED_NUMERIC_CLAIMS.filter((claim) => !Number.isFinite(claims[claim])),

@@ -248,18 +248,21 @@ describe('POST /api/oauth/token', () => {
       expect(response.body.error).to.equal('unsupported_grant_type');
     });
 
-    it('answers 400 unsupported_grant_type for authorization_code — ticket 39b', async () => {
+    // 39b dispatch smoke: empty form → invalid_request from the grant handler
+    // (unsupported_grant_type would mean dispatch missed). Full grant tests
+    // live in oauthToken.authorizationCode / .refreshToken.
+    it('dispatches authorization_code to its own handler — ticket 39b', async () => {
       const response = await post(makeApp(), exchangeForm({ grant_type: 'authorization_code' }));
 
       expect(response.status).to.equal(400);
-      expect(response.body.error).to.equal('unsupported_grant_type');
+      expect(response.body.error).to.equal('invalid_request');
     });
 
-    it('answers 400 unsupported_grant_type for refresh_token — ticket 39b', async () => {
+    it('dispatches refresh_token to its own handler — ticket 39b', async () => {
       const response = await post(makeApp(), exchangeForm({ grant_type: 'refresh_token' }));
 
       expect(response.status).to.equal(400);
-      expect(response.body.error).to.equal('unsupported_grant_type');
+      expect(response.body.error).to.equal('invalid_request');
     });
 
     it('answers 400 invalid_request for an absent grant type', async () => {
