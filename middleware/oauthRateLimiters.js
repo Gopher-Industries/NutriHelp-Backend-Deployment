@@ -107,17 +107,55 @@ const createMcpServiceLimiter = ({
 const mcpServiceAddressLimiter = createMcpServiceLimiter();
 
 /**
+ * The oauth router's mount path, and the ONE place it is written down.
+ * MCP_SERVICE_PATHS and the global body-parser skip both derive from it so the
+ * limiter carve-out and the parser carve-out cannot drift apart.
+ */
+const OAUTH_ROUTER_PREFIX = '/api/oauth';
+
+/**
  * Paths the global limiter skips. Limited only because server.js does
  * `app.use(MCP_SERVICE_PATHS, mcpServiceAddressLimiter)` unconditionally,
  * above the global limiter and the 50mb parsers — not in routes/oauth.js
  * (flag-off would leave skip with no replacement). Next: ticket 34 ingest.
  */
-const MCP_SERVICE_PATHS = ['/api/oauth/introspect', '/api/oauth/token'];
+const MCP_SERVICE_PATHS = [`${OAUTH_ROUTER_PREFIX}/introspect`, `${OAUTH_ROUTER_PREFIX}/token`];
 
 const isMcpServicePath = (req) => {
   const path = req.path || '';
   return MCP_SERVICE_PATHS.some((candidate) => path === candidate);
 };
+
+/** Whole router, not just the two service paths — see skipOauthRouter. */
+const isOauthRouterPath = (req) => {
+  const path = req.path || '';
+  return path === OAUTH_ROUTER_PREFIX || path.startsWith(`${OAUTH_ROUTER_PREFIX}/`);
+};
+
+/**
+ * Ticket 45 — wraps a global body parser so it does NOT consume `/api/oauth`
+ * bodies, leaving the router's own 16kb parser as the first to see them.
+ *
+ * WHY NOT "MOUNT THE ROUTER ABOVE THE PARSERS", which is the obvious fix and
+ * the one the ticket text suggests: the global rate limiter sits above the
+ * parsers too, and `/authorize` is deliberately UNDER that bucket (server.js
+ * says so where the limiter is built). Hoisting the router would silently take
+ * `/authorize` out of it — trading a body-size hole for a rate-limit hole.
+ * Skipping the parsers moves nothing.
+ *
+ * SCOPED TO THE WHOLE ROUTER, not to MCP_SERVICE_PATHS. Only `/introspect`
+ * and `/token` read a body today, so the narrow version would work — and would
+ * silently put the next `/api/oauth` route back on 50mb, because nothing would
+ * fail when it was added.
+ *
+ * Named function expression on purpose: express reports `fn.name` as the layer
+ * name, so the composition suite can assert the wrapper is actually mounted.
+ */
+const skipOauthRouter = (parser) =>
+  function skipOauthRouter(req, res, next) {
+    if (isOauthRouterPath(req)) return next();
+    return parser(req, res, next);
+  };
 
 /** Test seam only — express-rate-limit keeps counts on the store instance. */
 const resetAllForTests = () => {
@@ -131,7 +169,10 @@ module.exports = {
   metadataFetchClientLimiter,
   mcpServiceAddressLimiter,
   isMcpServicePath,
+  isOauthRouterPath,
+  skipOauthRouter,
   resetAllForTests,
+  OAUTH_ROUTER_PREFIX,
   MCP_SERVICE_PATHS,
   AUTHORIZE_WINDOW_MS,
   AUTHORIZE_MAX,

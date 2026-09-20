@@ -13,9 +13,11 @@ const defaultOauthRateLimiters = require('../middleware/oauthRateLimiters');
  *
  * No trailing-slash redirect: MCP uses redirect:'error', so any 3xx hard-fails.
  *
- * Local urlencoded({limit:'16kb'}) is a NO-OP in production: server.js parses
- * globally at 50mb first and sets req._body. Kept for standalone mounts;
- * tightening production means editing server.js. See composition test.
+ * WARNING: this urlencoded({limit:'16kb'}) IS IN FORCE as of ticket 45, where it
+ * used to be a no-op, so raising or removing it changes what the public /token
+ * and /introspect endpoints accept from anonymous callers. server.js skips the
+ * global parsers for this prefix; oauthRateLimiters.skipOauthRouter says why, and
+ * the composition suite proves the skip is what does the work.
  */
 const createOauthRouter = (deps = {}) => {
   const controller = deps.oauthIntrospectController || oauthIntrospectController;

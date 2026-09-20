@@ -162,8 +162,11 @@ try {
 }
 
 app.use(responseTimeLogger);
-app.use(express.json({ limit: '50mb' }));
-app.use(express.urlencoded({ limit: '50mb', extended: true }));
+// Ticket 45: these two SKIP /api/oauth so the router's own 16kb parser is the
+// first to see those bodies. Skipping rather than hoisting the router, and the
+// whole-prefix scope, are both load-bearing - see oauthRateLimiters.skipOauthRouter.
+app.use(oauthRateLimiters.skipOauthRouter(express.json({ limit: '50mb' })));
+app.use(oauthRateLimiters.skipOauthRouter(express.urlencoded({ limit: '50mb', extended: true })));
 
 app.use(metricsMiddleware);
 app.get('/api/metrics', metricsEndpoint);

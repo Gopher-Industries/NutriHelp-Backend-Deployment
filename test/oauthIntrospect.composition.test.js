@@ -16,12 +16,30 @@ const jwt = require('jsonwebtoken');
 const request = require('supertest');
 
 const responseContractMiddleware = require('../middleware/responseContract');
+const oauthRateLimiters = require('../middleware/oauthRateLimiters');
 const { createOauthRouter } = require('../routes/oauth');
 
 /**
  * App assembled like server.js (responseContract → global parsers → router).
- * Bare-express endpoint tests miss that the router’s 16kb urlencoded is a
- * no-op once server.js has parsed at 50mb and set req._body.
+ * Bare-express endpoint tests miss the composition entirely, which is the whole
+ * reason this file exists: BEFORE ticket 45 the router's 16kb urlencoded was a
+ * no-op, because server.js had already parsed at 50mb and set req._body. The
+ * skip is what makes it real, and these tests fail without it.
+ *
+ * WARNING: A NON-FORM body still answers 400 here, NOT 413, and that is correct
+ * rather than a hole. With the globals skipped and only urlencoded mounted, an
+ * application/json body matches no parser, so body-parser calls next() without
+ * ever consuming the stream. Measured on a 40MB JSON POST to /token: the
+ * pre-ticket-45 shape grew the heap 1358.5 MB (the global json parser buffered,
+ * decoded and tried to parse it - roughly 34x the bytes on the wire); this shape
+ * grew it 0.2 MB. So the 50mb cap WAS the exposure, and 400-not-413 is the body
+ * never being read. Do NOT "fix" this by mounting express.json beside
+ * urlencoded: RFC 7662 and RFC 8693 both require
+ * application/x-www-form-urlencoded at these endpoints, so JSON is not a valid
+ * content type here and 400 is the spec-correct answer. What the 16kb limit
+ * does NOT bound is transmission - a client can still send a large body and
+ * hold a socket until the 400. That is a slowloris shape, unchanged by this
+ * ticket and not what it was scoped to fix.
  *
  * Global per-IP limiter (~1.1 req/s shared MCP egress): SETTLED by ticket 45,
  * in this file — see the "MCP service paths are limited in server.js
@@ -170,13 +188,26 @@ const makeCompositionDeps = (dbOptions = {}) => ({
   introspectionLog: { logOperational: async () => {}, logGrantRefusal: async () => {} },
 });
 
-const makeProductionShapedApp = (dbOptions = {}) => {
+/**
+ * @param options.skipOauthBodyParsing  false builds the MUTATION TWIN — the
+ *   global parsers mounted UNWRAPPED, exactly as server.js had them before
+ *   ticket 45. Every 413 case below must answer 200 against that twin; that is
+ *   what proves the skip is the thing doing the work rather than some other
+ *   layer refusing large bodies for its own reasons.
+ */
+const makeProductionShapedApp = (dbOptions = {}, { skipOauthBodyParsing = true } = {}) => {
   const deps = makeCompositionDeps(dbOptions);
+  const wrap = skipOauthBodyParsing ? oauthRateLimiters.skipOauthRouter : (parser) => parser;
 
   const app = express();
   app.use(responseContractMiddleware); // server.js: app.use(responseContractMiddleware)
-  app.use(express.json({ limit: '50mb' })); // server.js: express.json
-  app.use(express.urlencoded({ limit: '50mb', extended: true })); // server.js: express.urlencoded
+  app.use(wrap(express.json({ limit: '50mb' }))); // server.js: express.json
+  app.use(wrap(express.urlencoded({ limit: '50mb', extended: true }))); // server.js: urlencoded
+
+  // Non-oauth route: proves the 50mb parser still applies everywhere else, so
+  // the skip stayed scoped and did not become a global limit change.
+  app.post('/api/echo', (req, res) => res.json({ fields: Object.keys(req.body || {}).length }));
+
   app.use('/api/oauth', createOauthRouter(deps)); // server.js: routesRegistrar(app)
   return app;
 };
@@ -318,25 +349,28 @@ describe('POST /api/oauth/introspect — assembled as server.js assembles it', (
   });
 
   describe('what the bare-express harness could not see', () => {
-    it('the global 50mb parser has already consumed the body, so the router 16kb limit never applies', () => {
-      // Documents the real behaviour rather than asserting the comment. If
-      // server.js's global parser is ever removed, this test's premise changes
-      // and the router's own parser becomes live — which is the moment someone
-      // should re-read routes/oauth.js's banner.
+    // REWRITTEN BY TICKET 45, NOT ADDED TO. These two used to PIN the
+    // no-op: one asserted the global parser preceded the router in the stack,
+    // the other POSTed 40 KB and required 200, "proving that limit is not in
+    // force". The fix inverts both, so leaving them in place would have left
+    // the suite red and looking like a regression.
+
+    it('leaves the global 50mb parser in force on non-oauth routes', () => {
+      // The skip must be scoped. If this ever fails, the change stopped being
+      // "oauth parses its own bodies" and became a global limit change — and
+      // the 50mb almost certainly serves uploads.
       const app = makeProductionShapedApp();
       const layerNames = app._router.stack.map((l) => l.name);
 
-      expect(layerNames).to.include('urlencodedParser');
-      expect(layerNames.indexOf('urlencodedParser')).to.be.below(
+      expect(layerNames.filter((name) => name === 'skipOauthRouter')).to.have.lengthOf(2);
+      expect(layerNames.indexOf('skipOauthRouter')).to.be.below(
         layerNames.length - 1,
-        'the global parser must precede the oauth router'
+        'the wrapped global parsers must still precede the oauth router'
       );
     });
 
-    it('accepts a body larger than the router 16kb limit, proving that limit is not in force', async () => {
-      // ~40 KB of padding. Under the router's declared 16 KB limit this would
-      // be a 413; in the deployed composition it is parsed and the request
-      // proceeds normally. The endpoint still fails closed on the content.
+    it('refuses a body larger than the router 16kb limit with 413', async () => {
+      // ~40 KB of padding: over the router's 16 KB, under the global 50mb.
       const app = makeProductionShapedApp();
 
       const response = await request(app)
@@ -350,8 +384,122 @@ describe('POST /api/oauth/introspect — assembled as server.js assembles it', (
           padding: 'x'.repeat(40000),
         });
 
+      expect(response.status).to.equal(413);
+    });
+
+    it('refuses a 17kb body on /introspect', async () => {
+      const response = await request(makeProductionShapedApp())
+        .post('/api/oauth/introspect')
+        .type('form')
+        .send({ token: 'x', padding: 'y'.repeat(17 * 1024) });
+
+      expect(response.status).to.equal(413);
+    });
+
+    it('refuses a 17kb body on /token', async () => {
+      const response = await request(makeProductionShapedApp())
+        .post('/api/oauth/token')
+        .type('form')
+        .send({ grant_type: 'refresh_token', padding: 'y'.repeat(17 * 1024) });
+
+      expect(response.status).to.equal(413);
+    });
+
+    it('still accepts an ordinary body — the 413 cases are not vacuous', async () => {
+      // Without this, every 413 above is satisfied by a route that refuses
+      // everything, including a correctly sized request.
+      const response = await send(makeProductionShapedApp());
+
       expect(response.status).to.equal(200);
       expect(response.body.active).to.equal(true);
+    });
+
+    it('accepts the same oversized bodies when the parsers are NOT skipped', async () => {
+      // The mutation twin. server.js's pre-ticket-45 shape: unwrapped global
+      // parsers. If this ever answers 413, something other than the skip is
+      // refusing these bodies and the tests above prove nothing.
+      const twin = makeProductionShapedApp({}, { skipOauthBodyParsing: false });
+
+      const introspect = await request(twin)
+        .post('/api/oauth/introspect')
+        .type('form')
+        .send({
+          token: mintAccessToken(),
+          token_type_hint: 'access_token',
+          client_assertion_type: 'urn:ietf:params:oauth:client-assertion-type:jwt-bearer',
+          client_assertion: mintClientAssertion(),
+          padding: 'x'.repeat(40000),
+        });
+
+      expect(introspect.status).to.equal(200);
+      expect(introspect.body.active).to.equal(true);
+
+      // /token too. Three 413 cases exist and the promise above is universal;
+      // covering only /introspect left it standing on a third of its cases.
+      const token = await request(twin)
+        .post('/api/oauth/token')
+        .type('form')
+        .send({
+          grant_type: 'urn:ietf:params:oauth:grant-type:token-exchange',
+          subject_token: mintAccessToken(),
+          subject_token_type: 'urn:ietf:params:oauth:token-type:access_token',
+          client_assertion_type: 'urn:ietf:params:oauth:client-assertion-type:jwt-bearer',
+          client_assertion: mintClientAssertion(),
+          padding: 'x'.repeat(40000),
+        });
+
+      expect(
+        token.status,
+        'the oversized /token body is NOT refused for its size once the parsers are unskipped'
+      ).to.not.equal(413);
+    });
+
+    it('wraps BOTH global parsers in the oauth skip in server.js itself', () => {
+      // WITHOUT THIS, EVERY 413 TEST ABOVE IS UNFALSIFIABLE. They run
+      // against makeProductionShapedApp, which is hand-assembled and uses the
+      // wrapper because THIS FILE says to. Deleting the wrap from server.js
+      // leaves all of them green while production goes straight back to
+      // accepting 50mb from anonymous callers. Measured: that mutation was
+      // silent until this assertion existed.
+      //
+      // Middleware composition is a source-order property and cannot be
+      // observed at runtime without booting the listener, so it is asserted
+      // against the source — the same approach the service-bucket test below
+      // already takes.
+      const source = require('fs').readFileSync(path.join(__dirname, '..', 'server.js'), 'utf8');
+
+      expect(source).to.contain("skipOauthRouter(express.json({ limit: '50mb' }))");
+      expect(source).to.contain(
+        "skipOauthRouter(express.urlencoded({ limit: '50mb', extended: true }))"
+      );
+    });
+
+    it('skips the WHOLE oauth prefix, not only the two service paths', () => {
+      // Narrowing the skip to MCP_SERVICE_PATHS works today and would put the
+      // NEXT /api/oauth route back on 50mb silently. No request-level test can
+      // catch that, because the route does not exist yet.
+      const { isOauthRouterPath } = oauthRateLimiters;
+
+      expect(isOauthRouterPath({ path: '/api/oauth/introspect' })).to.equal(true);
+      expect(isOauthRouterPath({ path: '/api/oauth/token' })).to.equal(true);
+      expect(isOauthRouterPath({ path: '/api/oauth/authorize' })).to.equal(true);
+      expect(isOauthRouterPath({ path: '/api/oauth/a-route-that-does-not-exist-yet' })).to.equal(
+        true
+      );
+
+      expect(isOauthRouterPath({ path: '/api/oauthx/token' })).to.equal(false);
+      expect(isOauthRouterPath({ path: '/api/meals' })).to.equal(false);
+    });
+
+    it('still parses a body far over 16kb on a non-oauth route', async () => {
+      // The skip is a carve-out, not a new global ceiling.
+      const response = await request(makeProductionShapedApp())
+        .post('/api/echo')
+        .type('form')
+        .send({ padding: 'z'.repeat(2 * 1024 * 1024) });
+
+      expect(response.status).to.equal(200);
+      expect(response.body.fields).to.equal(1);
     });
 
     it('responseContract does not append _contractWarnings to an RFC 7662 body', async () => {
@@ -665,7 +813,10 @@ describe('ticket 45 — the MCP service paths are limited in server.js compositi
 
     const mount = source.indexOf('app.use(oauthRateLimiters.MCP_SERVICE_PATHS');
     const globalLimiter = source.indexOf('app.use(limiter)');
-    const jsonParser = source.indexOf("app.use(express.json({ limit: '50mb' }))");
+    // Matches the parser itself, not the app.use( wrapper around it: ticket 45
+    // wrapped these in skipOauthRouter, and this assertion is about ORDER, not
+    // about how the parser is mounted.
+    const jsonParser = source.indexOf("express.json({ limit: '50mb' })");
 
     expect(mount, 'server.js must mount the MCP service bucket at app level').to.be.greaterThan(-1);
     expect(globalLimiter).to.be.greaterThan(-1);
