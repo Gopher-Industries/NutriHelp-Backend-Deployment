@@ -355,17 +355,34 @@ describe('POST /api/oauth/introspect — assembled as server.js assembles it', (
     // force". The fix inverts both, so leaving them in place would have left
     // the suite red and looking like a regression.
 
-    it('leaves the global 50mb parser in force on non-oauth routes', () => {
-      // The skip must be scoped. If this ever fails, the change stopped being
-      // "oauth parses its own bodies" and became a global limit change — and
-      // the 50mb almost certainly serves uploads.
+    it('mounts BOTH wrapped parsers above the oauth router layer', () => {
+      // Both global parsers are wrapped, and both sit above the router — if
+      // either dropped below it, the router's 16kb parser would run first, set
+      // req._body, and the global parser would be the no-op instead. The skip
+      // only means anything from above.
+      //
+      // WARNING: compare against the ROUTER's index, and take lastIndexOf.
+      // The predecessor of this case read
+      //   indexOf('skipOauthRouter') < layerNames.length - 1
+      // which is arithmetically incapable of failing once there are two
+      // wrappers: indexOf finds the FIRST, so it is at most length - 2 in
+      // every possible stack. It COULD fail when there was one parser layer
+      // and "is it last?" was a real question; adding the second wrapper
+      // retired it silently, which is the shape this file keeps finding.
       const app = makeProductionShapedApp();
       const layerNames = app._router.stack.map((l) => l.name);
 
       expect(layerNames.filter((name) => name === 'skipOauthRouter')).to.have.lengthOf(2);
-      expect(layerNames.indexOf('skipOauthRouter')).to.be.below(
-        layerNames.length - 1,
-        'the wrapped global parsers must still precede the oauth router'
+
+      // express.Router() is a function named `router`; the mounted oauth
+      // router is the only one in this app. Asserting there is exactly one
+      // keeps the index below unambiguous.
+      const routerLayerNames = layerNames.filter((name) => name === 'router');
+      expect(routerLayerNames, 'exactly one mounted router layer').to.have.lengthOf(1);
+
+      expect(layerNames.lastIndexOf('skipOauthRouter')).to.be.below(
+        layerNames.indexOf('router'),
+        'both wrapped global parsers must precede the oauth router'
       );
     });
 
@@ -436,22 +453,36 @@ describe('POST /api/oauth/introspect — assembled as server.js assembles it', (
 
       // /token too. Three 413 cases exist and the promise above is universal;
       // covering only /introspect left it standing on a third of its cases.
+      //
+      // PIN THE OUTCOME, not merely "not 413". A bare not-413 is satisfied by
+      // a 400, a 500 or an unhandled throw, so it proves the request was not
+      // refused for its SIZE without proving the oversized body was ever read.
+      //
+      // 200 is not available here: makeCompositionDeps serves only the tables
+      // introspection touches, so a real exchange hits `unexpected table`,
+      // and the controller answers 503 server_error — a status that says
+      // nothing about whether the body was parsed. So drive the one thing the
+      // controller dispatches on. An UNKNOWN grant_type answers 400
+      // unsupported_grant_type; an absent or unparsed one answers 400
+      // invalid_request. The two are distinguishable, which makes
+      // unsupported_grant_type POSITIVE evidence that the 40 KB body was
+      // parsed and its fields reached the handler.
       const token = await request(twin)
         .post('/api/oauth/token')
         .type('form')
         .send({
-          grant_type: 'urn:ietf:params:oauth:grant-type:token-exchange',
-          subject_token: mintAccessToken(),
-          subject_token_type: 'urn:ietf:params:oauth:token-type:access_token',
-          client_assertion_type: 'urn:ietf:params:oauth:client-assertion-type:jwt-bearer',
-          client_assertion: mintClientAssertion(),
+          grant_type: 'urn:nutrihelp:test:not-a-real-grant',
           padding: 'x'.repeat(40000),
         });
 
       expect(
         token.status,
         'the oversized /token body is NOT refused for its size once the parsers are unskipped'
-      ).to.not.equal(413);
+      ).to.equal(400);
+      expect(
+        token.body.error,
+        'the handler read grant_type OUT of the oversized body — an unread body answers invalid_request'
+      ).to.equal('unsupported_grant_type');
     });
 
     it('wraps BOTH global parsers in the oauth skip in server.js itself', () => {
@@ -466,11 +497,21 @@ describe('POST /api/oauth/introspect — assembled as server.js assembles it', (
       // observed at runtime without booting the listener, so it is asserted
       // against the source — the same approach the service-bucket test below
       // already takes.
+      //
+      // WARNING: strip comments first and anchor on `app.use(`. Asserting the
+      // bare wrapper substring against the raw source was satisfied by a
+      // COMMENTED-OUT line — which is the ordinary way someone disables
+      // middleware while debugging — so the guard survived the exact mutation
+      // it exists to catch, and production went back to 50mb. Same
+      // comment-stripping pair the two source tests below already use.
       const source = require('fs').readFileSync(path.join(__dirname, '..', 'server.js'), 'utf8');
+      const code = source.replace(/\/\*[\s\S]*?\*\//g, '').replace(/\/\/.*$/gm, '');
 
-      expect(source).to.contain("skipOauthRouter(express.json({ limit: '50mb' }))");
-      expect(source).to.contain(
-        "skipOauthRouter(express.urlencoded({ limit: '50mb', extended: true }))"
+      expect(code).to.contain(
+        "app.use(oauthRateLimiters.skipOauthRouter(express.json({ limit: '50mb' })))"
+      );
+      expect(code).to.contain(
+        "app.use(oauthRateLimiters.skipOauthRouter(express.urlencoded({ limit: '50mb', extended: true })))"
       );
     });
 
@@ -489,6 +530,63 @@ describe('POST /api/oauth/introspect — assembled as server.js assembles it', (
 
       expect(isOauthRouterPath({ path: '/api/oauthx/token' })).to.equal(false);
       expect(isOauthRouterPath({ path: '/api/meals' })).to.equal(false);
+    });
+
+    it('matches the prefix the way express routes it — case-INSENSITIVELY', () => {
+      // Express 4 routes case-insensitively unless `case sensitive routing`
+      // is set, and server.js never sets it. A case-SENSITIVE predicate
+      // therefore steps aside for a spelling the router still serves.
+      //
+      // Both predicates, in one case, because they are the same bug: the
+      // parser carve-out is a body-size bypass, and the limiter carve-out
+      // double-limits uppercase MCP traffic under the global bucket that
+      // ticket 45 carved it out of.
+      const { isOauthRouterPath, isMcpServicePath } = oauthRateLimiters;
+
+      for (const spelling of ['/API/OAUTH/token', '/Api/OAuth/Token', '/api/OAUTH/introspect']) {
+        expect(isOauthRouterPath({ path: spelling }), spelling).to.equal(true);
+        expect(isMcpServicePath({ path: spelling }), spelling).to.equal(true);
+      }
+
+      // Still scoped: case-folding must not widen the prefix itself.
+      expect(isOauthRouterPath({ path: '/API/OAUTHX/token' })).to.equal(false);
+      expect(isMcpServicePath({ path: '/API/OAUTH/authorize' })).to.equal(false);
+    });
+
+    it('refuses a 17kb body on an UPPERCASE oauth path with 413', async () => {
+      // THE CASE THAT PINS THE PREDICATE TO EXPRESS RATHER THAN TO THE
+      // CONSTANT. The prefix test above feeds it lowercase literals only,
+      // which is exactly how a case-sensitive predicate shipped: it agreed
+      // with every string the test handed it and disagreed with the router.
+      //
+      // Measured before the fix, on this app shape: /api/oauth/token answered
+      // 413 while /API/OAUTH/token answered 200 on a 40000-byte body. The
+      // global 50mb parser consumed it, set req._body, and the router's 16kb
+      // parser called next() on sight of req._body.
+      const app = makeProductionShapedApp();
+
+      const oversized = await request(app)
+        .post('/API/OAUTH/token')
+        .type('form')
+        .send({ grant_type: 'refresh_token', padding: 'y'.repeat(17 * 1024) });
+
+      expect(oversized.status).to.equal(413);
+
+      // Not vacuous: the uppercase spelling really is routed and served, so
+      // the 413 above is the size limit rather than the path 404ing.
+      const ordinary = await request(app)
+        .post('/API/OAUTH/introspect')
+        .type('form')
+        .set('x-correlation-id', crypto.randomUUID())
+        .send({
+          token: mintAccessToken(),
+          token_type_hint: 'access_token',
+          client_assertion_type: 'urn:ietf:params:oauth:client-assertion-type:jwt-bearer',
+          client_assertion: mintClientAssertion(),
+        });
+
+      expect(ordinary.status).to.equal(200);
+      expect(ordinary.body.active).to.equal(true);
     });
 
     it('still parses a body far over 16kb on a non-oauth route', async () => {
@@ -804,28 +902,65 @@ describe('ticket 45 — the MCP service paths are limited in server.js compositi
     expect(app.probe.parserRan, 'the defective arm must read the body').to.equal(true);
   });
 
-  it('mounts the service bucket in server.js above the global limiter AND the parsers', () => {
-    // The cases above assemble the app themselves, so they prove the SHAPE of
-    // the fix works — not that server.js uses that shape. This asserts the
-    // real file does, which cannot be observed at runtime without booting the
-    // listener. Middleware order is a source-order property; assert it there.
+  it('mounts the service bucket in server.js above the global limiter, the parsers AND the routes', () => {
+    // Every case above assembles its own app, so they prove the SHAPE of the fix and not
+    // that server.js uses it. Middleware order is a source-order property, so it is asserted
+    // against the source; comments are stripped first and every anchor carries its `app.use(`,
+    // because a commented-out mount would otherwise satisfy a bare anchor.
+    //
+    // THE ROUTER ANCHOR IS WHY THIS PINS PRODUCTION RATHER THAN A FIXTURE. Until it existed,
+    // `routesRegistrar` appeared in this file once, in a comment - so the mount could be hoisted
+    // above the global limiter with every gate green, pulling /authorize out of that bucket.
     const source = require('fs').readFileSync(path.join(__dirname, '..', 'server.js'), 'utf8');
+    const code = source.replace(/\/\*[\s\S]*?\*\//g, '').replace(/\/\/.*$/gm, '');
 
-    const mount = source.indexOf('app.use(oauthRateLimiters.MCP_SERVICE_PATHS');
-    const globalLimiter = source.indexOf('app.use(limiter)');
-    // Matches the parser itself, not the app.use( wrapper around it: ticket 45
-    // wrapped these in skipOauthRouter, and this assertion is about ORDER, not
-    // about how the parser is mounted.
-    const jsonParser = source.indexOf("express.json({ limit: '50mb' })");
+    const mount = code.indexOf('app.use(oauthRateLimiters.MCP_SERVICE_PATHS');
+    const globalLimiter = code.indexOf('app.use(limiter)');
+    const jsonParser = code.indexOf(
+      "app.use(oauthRateLimiters.skipOauthRouter(express.json({ limit: '50mb' })))"
+    );
+    const urlencodedParser = code.indexOf(
+      "app.use(oauthRateLimiters.skipOauthRouter(express.urlencoded({ limit: '50mb', extended: true })))"
+    );
+    // The call, not the require: `const routesRegistrar = require('./routes')`
+    // is a different line and pinning it would pin nothing about order.
+    const routesMounted = code.indexOf('routesRegistrar(app)');
+
+    // The predicates normalise case because express matches mounts case-insensitively by
+    // DEFAULT. Setting `case sensitive routing` inverts the pair: the skip still fires on
+    // /API/OAUTH/token while the mounts no longer match it, so the path is skipped from the
+    // global limiter AND absent from the MCP bucket - unlimited, then 404. Measured.
+    // The uppercase flood case cannot catch this: it assembles its own app, so a flag set
+    // HERE leaves it green. Same reason the router anchor above exists.
+    expect(
+      code,
+      'server.js must not set `case sensitive routing` - it would leave uppercase oauth paths unlimited'
+    ).to.not.match(/app\.set\(\s*['"`]case sensitive routing['"`]/);
 
     expect(mount, 'server.js must mount the MCP service bucket at app level').to.be.greaterThan(-1);
     expect(globalLimiter).to.be.greaterThan(-1);
     expect(jsonParser).to.be.greaterThan(-1);
+    expect(urlencodedParser).to.be.greaterThan(-1);
+    // Asserted so a rename cannot turn every ordering check below into -1 < n.
+    expect(routesMounted, 'server.js must register the routers via routesRegistrar(app)').to.be.greaterThan(-1);
 
     // Above the global limiter, or the skip fires with no replacement.
     expect(mount).to.be.lessThan(globalLimiter);
     // Above the parsers, or a flood is body-parsed at 50mb before the 429.
     expect(mount).to.be.lessThan(jsonParser);
+
+    // The router stays BELOW both: above the limiter takes /authorize out of its bucket;
+    // above the parsers makes the skip a no-op, the router's 16kb parser seeing the body first.
+    expect(globalLimiter, 'the global limiter must precede routesRegistrar(app)').to.be.lessThan(
+      routesMounted
+    );
+    expect(jsonParser, 'the wrapped json parser must precede routesRegistrar(app)').to.be.lessThan(
+      routesMounted
+    );
+    expect(
+      urlencodedParser,
+      'the wrapped urlencoded parser must precede routesRegistrar(app)'
+    ).to.be.lessThan(routesMounted);
   });
 
   it('never conditions the MCP service mount on the route flag', () => {
@@ -908,5 +1043,74 @@ describe('ticket 45 — the MCP service paths are limited in server.js compositi
     const res = await request(app).get('/api/oauth/authorize').set('X-Forwarded-For', ip);
 
     expect(res.status).to.not.equal(429);
+  });
+
+  it('buckets an UPPERCASE service path the way express mounts it, and still skips it', async () => {
+    // THE CASE THAT PINS THE LIMITER HALF TO EXPRESS RATHER THAN TO LITERALS.
+    // Lowercasing isMcpServicePath is only SAFE because `app.use(pathArray, mw)`
+    // matches case-insensitively. Nothing else asserted that: the predicate case
+    // above hands literals to the predicate, which is the same shape as this
+    // ticket's original mutation failure — a control pinned by what the test
+    // invents rather than by the framework's behaviour.
+    //
+    // If app.use ever stops matching case-insensitively — and the middleware's
+    // own comment names `app.set('case sensitive routing', true)` as the
+    // alternative someone might reach for — the skip and the bucket INVERT:
+    // /API/OAUTH/token becomes skipped from the global limiter AND absent from
+    // the MCP bucket, i.e. completely unlimited. Measured on this app shape:
+    // with that flag set the uppercase flood answers 404,404,404,404 — no 429
+    // from either bucket.
+    //
+    // The two arms fail on different mutations, which is why both are here:
+    //   arm 1 goes red if app.use stops matching case-insensitively
+    //          (nothing limits the uppercase path at all)
+    //   arm 2 goes red if normalisePath is de-normalised
+    //          (the bucket still engages, but the global budget is spent too)
+    const [servicePath] = oauthRateLimiters.MCP_SERVICE_PATHS;
+    const upperPath = servicePath.toUpperCase();
+    // Non-vacuity: an all-uppercase constant would make this case test nothing.
+    expect(upperPath, 'MCP_SERVICE_PATHS must be lowercase for this to mean anything').to.not.equal(
+      servicePath
+    );
+
+    // globalLimit === FLOOD_LIMIT is load-bearing for arm 2. The service bucket
+    // lets exactly FLOOD_LIMIT requests through before it answers 429, so those
+    // are the only ones that can ever reach the global limiter. Sizing the
+    // global bucket any larger leaves budget over and arm 2 cannot fail.
+    const app = makeServerOrderApp({
+      routerMounted: false,
+      serviceLimiter: oauthRateLimiters.createMcpServiceLimiter({ limit: FLOOD_LIMIT }),
+      globalLimit: FLOOD_LIMIT,
+    });
+    const ip = '203.0.113.97';
+
+    // ARM 1 — the MCP bucket engaged on the uppercase spelling.
+    for (let i = 0; i < FLOOD_LIMIT; i += 1) {
+      const allowed = await request(app)
+        .post(upperPath)
+        .type('form')
+        .set('X-Forwarded-For', ip)
+        .send({});
+      // Not vacuous: the refusal below must be the limit engaging, not a
+      // blanket refusal of the uppercase spelling. 404 here — the router is
+      // deliberately unmounted, so the limiters are the only thing under test.
+      expect(allowed.status, `uppercase request ${i + 1} should not be limited`).to.not.equal(429);
+    }
+    const limited = await request(app)
+      .post(upperPath)
+      .type('form')
+      .set('X-Forwarded-For', ip)
+      .send({});
+
+    expect(limited.status, `${upperPath} must be inside the MCP bucket`).to.equal(429);
+
+    // ARM 2 — and the global bucket was NOT spent on it. With the skip
+    // de-normalised the FLOOD_LIMIT allowed requests above fall through to the
+    // global limiter, exhaust it exactly, and this answers 429 instead.
+    const other = await request(app).get('/api/oauth/authorize').set('X-Forwarded-For', ip);
+
+    expect(other.status, 'the global budget must not have been spent on the uppercase path').to.not.equal(
+      429
+    );
   });
 });
