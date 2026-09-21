@@ -14,7 +14,9 @@ const UNIQUE_VIOLATION = '23505';
  * @param seed.codes           oauth_authorization_codes rows
  * @param seed.refreshTokens   oauth_refresh_tokens rows
  * @param seed.grants          mcp_client_grants rows
- * @param seed.failures        { '<table>.<op>': error } — mutable mid-test via db.failures
+ * @param seed.failures        { '<table>.<op>': error } — mutable mid-test via db.failures.
+ *   A function value is called with { filters, patch } and fails only that
+ *   call when it returns an error, e.g. only the release that nulls used_at.
  * @param seed.insertCommitsThenFails  row written, call still errors (timeout after commit); once, child inserts only
  * @param seed.consumeCodeAfterRead  concurrent redeem: read unconsumed, then consumed before our update
  * @param seed.claimTokenAfterRead  concurrent rotation: refresh token reads back
@@ -89,7 +91,11 @@ const makeDb = ({
     const run = () => {
       const rows = tables[table];
       const op = pending ? pending.op : 'select';
-      const injected = failures[`${table}.${op}`];
+      const failure = failures[`${table}.${op}`];
+      const injected =
+        typeof failure === 'function'
+          ? failure({ filters: filters.slice(), patch: pending ? pending.patch : undefined })
+          : failure;
       if (injected) return { data: null, error: injected };
 
       if (op === 'insert') {

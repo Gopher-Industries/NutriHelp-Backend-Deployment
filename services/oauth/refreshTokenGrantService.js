@@ -10,7 +10,8 @@ const refreshTokenStore = require('./refreshTokenStore');
  *   {outcome:'unavailable', detail}
  *
  * Successful refresh consumes the presented token and returns one child.
- * Reuse (used/revoked/replaced) revokes the family and grant — intentional.
+ * Reuse (revoked, replaced, or used with a child) revokes the family and grant —
+ * intentional. Used with no child is a claim in flight or stranded (ticket 88).
  *
  * ⚠️ Expiry is not reuse: refuse only, do not sweep.
  * Grant-status guard required (see grantRevocationService).
@@ -48,7 +49,7 @@ const rotateRefreshToken = async (body, deps = {}) => {
     return refuse('invalid_grant', 'refresh_client_mismatch');
   }
 
-  if (store.isReused(row)) {
+  const reuse = async () => {
     const swept = await store.revokeFamilyAndGrant(
       row.family_id,
       row.grant_id,
@@ -58,6 +59,23 @@ const rotateRefreshToken = async (body, deps = {}) => {
     // Failed sweep → 503, not invalid_grant (stolen family may still be live).
     if (!swept.ok) return unavailable(swept.detail);
     return refuse('invalid_grant', 'refresh_reuse_detected');
+  };
+
+  // revoked_at counts on its own: a family sweep never sets used_at.
+  if (row.revoked_at || row.replaced_by_id) return reuse();
+
+  // Ticket 88: used_at alone is a rotation in flight or a claim stranded by a
+  // failed insert whose release also failed. Only a child proves reuse.
+  let strandedUsedAt = null;
+  if (row.used_at) {
+    const probe = await store.findChildOf(row.id, deps);
+    if (!probe.ok) return unavailable(probe.detail);
+    if (probe.child) {
+      await store.linkReplacement(row.id, probe.child.id, deps);
+      return reuse();
+    }
+    if (store.isWithinLease(row.used_at)) return unavailable('refresh_rotation_in_flight');
+    strandedUsedAt = row.used_at;
   }
 
   if (store.isExpired(row)) return refuse('invalid_grant', 'refresh_token_expired');
@@ -120,20 +138,11 @@ const rotateRefreshToken = async (body, deps = {}) => {
 
   if (!minted.ok) return unavailable(minted.detail);
 
-  // Claim before replacement. Zero rows → concurrent rotation = reuse.
-  const claim = await store.claimRefreshToken(row.id, deps);
+  // Claim before replacement, or take over the stranded claim (CAS on its exact
+  // used_at). Zero rows: a concurrent presenter, so reuse — unlike the code path.
+  const claim = await store.claimRefreshToken(row.id, deps, strandedUsedAt);
   if (!claim.ok) return unavailable(claim.detail);
-
-  if (!claim.claimed) {
-    const swept = await store.revokeFamilyAndGrant(
-      row.family_id,
-      row.grant_id,
-      store.REUSE_REVOKE_REASON,
-      deps
-    );
-    if (!swept.ok) return unavailable(swept.detail);
-    return refuse('invalid_grant', 'refresh_reuse_detected');
-  }
+  if (!claim.claimed) return reuse();
 
   const child = await store.insertRefreshToken(
     {
@@ -150,19 +159,11 @@ const rotateRefreshToken = async (body, deps = {}) => {
 
   if (!child.ok) {
     // UNIQUE(parent_id) → family already forked.
-    if (child.detail === 'refresh_family_already_forked') {
-      const swept = await store.revokeFamilyAndGrant(
-        row.family_id,
-        row.grant_id,
-        store.REUSE_REVOKE_REASON,
-        deps
-      );
-      if (!swept.ok) return unavailable(swept.detail);
-      return refuse('invalid_grant', 'refresh_reuse_detected');
-    }
+    if (child.detail === 'refresh_family_already_forked') return reuse();
 
-    // Ordinary outage: release only after proving no child landed.
-    await store.releaseClaimIfNoChild(row.id, deps);
+    // Ordinary outage: release only after proving no child landed; if that
+    // fails too, the retry takes the stranded claim over after the lease.
+    await store.releaseClaimIfNoChild(row.id, deps, claim.claimedAt);
     return unavailable(child.detail);
   }
 

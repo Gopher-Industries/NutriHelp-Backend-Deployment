@@ -13,6 +13,8 @@ const request = require('supertest');
 
 const { createOauthRouter } = require('../routes/oauth');
 const mcpAccessTokenVerifier = require('../services/oauth/mcpAccessTokenVerifier');
+const { codeFamilyId } = require('../services/oauth/authorizationCodeGrantService');
+const { RETRY_LEASE_MS } = require('../services/oauth/refreshTokenStore');
 const { makeDb } = require('./helpers/oauthGrantTablesDouble');
 
 /**
@@ -63,6 +65,27 @@ const codeRow = (overrides = {}) => ({
   consumed_at: null,
   expires_at: secondsFromNow(60),
   created_at: new Date().toISOString(),
+  ...overrides,
+});
+
+const secondsAgo = (seconds) => new Date(Date.now() - seconds * 1000).toISOString();
+
+// Older than the retry lease, so a stranded consume is eligible for takeover.
+const PAST_LEASE = secondsAgo(RETRY_LEASE_MS / 1000 + 5);
+
+/** The refresh root this code opens: its presence means tokens WERE issued. */
+const codeRootRow = (overrides = {}) => ({
+  id: 7001,
+  token_hash: 'seeded-token-hash',
+  lookup_hash: 'seeded-lookup-hash',
+  grant_id: GRANT_ID,
+  family_id: codeFamilyId(sha256Hex(RAW_CODE)),
+  parent_id: null,
+  user_id: USER_ID,
+  client_id: ASSISTANT_CLIENT_ID,
+  resource: MCP_RESOURCE,
+  scopes: ['nutrition:read', 'mealplan:read'],
+  expires_at: secondsFromNow(3600),
   ...overrides,
 });
 
@@ -199,8 +222,11 @@ describe('POST /api/oauth/token — authorization_code + PKCE (ticket 39b)', () 
     });
 
     it('refuses a code that was already consumed', async () => {
+      // Consumed AND its root exists: a completed redemption (ticket 88 reads a
+      // consume with no root as stranded, not as consumed).
       const db = makeDb({
         codes: [codeRow({ consumed_at: new Date().toISOString() })],
+        refreshTokens: [codeRootRow()],
         grants: [grantRow()],
       });
       const response = await postCode(buildApp(db));
@@ -247,9 +273,12 @@ describe('POST /api/oauth/token — authorization_code + PKCE (ticket 39b)', () 
     });
 
     it('does not revoke when a consumed code is replayed with bindings that do not match', async () => {
-      // Unauthentic replay must not revoke (forced-disconnect if it did).
+      // Unauthentic replay must not revoke (forced-disconnect if it did). The
+      // root is seeded so the revoke branch is reachable: only the authentic
+      // check stands between this request and a revoke.
       const db = makeDb({
         codes: [codeRow({ consumed_at: new Date().toISOString() })],
+        refreshTokens: [codeRootRow()],
         grants: [grantRow()],
       });
       const response = await postCode(buildApp(db), {
@@ -261,12 +290,14 @@ describe('POST /api/oauth/token — authorization_code + PKCE (ticket 39b)', () 
       expect(response.status).to.equal(400);
       expect(response.body.error).to.equal('invalid_grant');
       expect(db.tables.mcp_client_grants[0].status).to.equal('active');
+      expect(db.tables.oauth_refresh_tokens[0].revoked_at == null).to.equal(true);
     });
 
     it('does not revoke when a consumed code is replayed with a wrong verifier', async () => {
       // Wrong verifier with matching client/redirect is still unauthentic.
       const db = makeDb({
         codes: [codeRow({ consumed_at: new Date().toISOString() })],
+        refreshTokens: [codeRootRow()],
         grants: [grantRow()],
       });
       const response = await postCode(buildApp(db), {
@@ -275,12 +306,16 @@ describe('POST /api/oauth/token — authorization_code + PKCE (ticket 39b)', () 
 
       expect(response.status).to.equal(400);
       expect(db.tables.mcp_client_grants[0].status).to.equal('active');
+      expect(db.tables.oauth_refresh_tokens[0].revoked_at == null).to.equal(true);
     });
 
     it('answers 503 when an authentic replay cannot be revoked', async () => {
       // Failed revoke → 503, not invalid_grant (tokens may still be live).
+      // Root present and consume past the lease: without the root branch this
+      // would take over and answer 200, so the 503 is the failed revoke.
       const db = makeDb({
-        codes: [codeRow({ consumed_at: new Date().toISOString() })],
+        codes: [codeRow({ consumed_at: PAST_LEASE })],
+        refreshTokens: [codeRootRow()],
         grants: [grantRow()],
         failures: { 'mcp_client_grants.update': { code: '08006' } },
       });
@@ -541,6 +576,219 @@ describe('POST /api/oauth/token — authorization_code + PKCE (ticket 39b)', () 
 
       expect(response.status).to.equal(503);
       expect(response.body.access_token).to.equal(undefined);
+    });
+  });
+
+  // Mutation-proven, one at a time, each red in this file: root-found branch removed;
+  // lease removed; authentic check removed, or moved below the revoke; takeover
+  // CAS or compensating release made unconditional; compensation without the
+  // probe, or none; expiry fail-open; mint moved after consume, or its !ok guard
+  // removed; random family id; root-probe failure read as "not found".
+  // Limitation: mint failure is driven through the config double (issuer URL
+  // null), so mint-before-consume is proven by behaviour, not by source order.
+  describe('a failed redemption must not look like replay (ticket 88)', () => {
+    const codeOf = (db) => db.tables.oauth_authorization_codes[0];
+    const grantOf = (db) => db.tables.mcp_client_grants[0];
+    const rootsOf = (db) => db.tables.oauth_refresh_tokens.filter((row) => row.parent_id == null);
+
+    // Fails only the compensating release (consumed_at back to NULL).
+    const failCodeRelease = ({ patch }) =>
+      patch && patch.consumed_at === null ? { code: '08006' } : null;
+
+    it('does not consume the code when minting fails, and the retry succeeds', async () => {
+      const db = makeDb({ codes: [codeRow()], grants: [grantRow()] });
+
+      const broken = await postCode(buildApp(db, { mcpAccessTokenIssuer: () => null }));
+      expect(broken.status).to.equal(503);
+      expect(codeOf(db).consumed_at == null, 'mint must precede the consume').to.equal(true);
+
+      const retry = await postCode(buildApp(db));
+      expect(retry.status, JSON.stringify(retry.body)).to.equal(200);
+    });
+
+    it('releases the consume when the sweep fails, so the retry succeeds', async () => {
+      const db = makeDb({
+        codes: [codeRow()],
+        grants: [grantRow()],
+        failures: { 'oauth_refresh_tokens.update': { code: '08006' } },
+      });
+      const app = buildApp(db);
+
+      expect((await postCode(app)).status).to.equal(503);
+      expect(codeOf(db).consumed_at == null, 'no root landed, so the consume is released').to.equal(
+        true
+      );
+
+      delete db.failures['oauth_refresh_tokens.update'];
+      const retry = await postCode(app);
+
+      expect(retry.status, JSON.stringify(retry.body)).to.equal(200);
+      expect(grantOf(db).status).to.equal('active');
+    });
+
+    it('releases the consume when the root insert fails, so the retry succeeds', async () => {
+      const db = makeDb({
+        codes: [codeRow()],
+        grants: [grantRow()],
+        failures: { 'oauth_refresh_tokens.insert': { code: '08006' } },
+      });
+      const app = buildApp(db);
+
+      expect((await postCode(app)).status).to.equal(503);
+      delete db.failures['oauth_refresh_tokens.insert'];
+      const retry = await postCode(app);
+
+      expect(retry.status, JSON.stringify(retry.body)).to.equal(200);
+      expect(grantOf(db).status).to.equal('active');
+      expect(rootsOf(db)).to.have.lengthOf(1);
+    });
+
+    it('recovers when the release fails too: 503 inside the lease, 200 after it', async () => {
+      // The realistic outage: the compensating write fails along with the insert.
+      const db = makeDb({
+        codes: [codeRow()],
+        grants: [grantRow()],
+        failures: {
+          'oauth_refresh_tokens.insert': { code: '08006' },
+          'oauth_authorization_codes.update': failCodeRelease,
+        },
+      });
+      const app = buildApp(db);
+
+      expect((await postCode(app)).status).to.equal(503);
+      expect(codeOf(db).consumed_at, 'the release failed, so the consume is stranded').to.be.a(
+        'string'
+      );
+      delete db.failures['oauth_refresh_tokens.insert'];
+
+      const inFlight = await postCode(app);
+      expect(inFlight.status, 'inside the lease the redemption may still be in flight').to.equal(
+        503
+      );
+      expect(grantOf(db).status).to.equal('active');
+
+      codeOf(db).consumed_at = PAST_LEASE;
+      const retry = await postCode(app);
+
+      expect(retry.status, JSON.stringify(retry.body)).to.equal(200);
+      expect(grantOf(db).status).to.equal('active');
+      expect(rootsOf(db)).to.have.lengthOf(1);
+    });
+
+    it('keeps the consume when the probe finds the root landed, so the retry revokes', async () => {
+      // Insert reported failure but the root exists: tokens WERE issued.
+      const db = makeDb({
+        codes: [codeRow()],
+        refreshTokens: [codeRootRow()],
+        grants: [grantRow()],
+        failures: { 'oauth_refresh_tokens.insert': { code: '08006' } },
+      });
+      const app = buildApp(db);
+
+      expect((await postCode(app)).status).to.equal(503);
+      expect(codeOf(db).consumed_at, 'a landed root must not be released').to.be.a('string');
+
+      delete db.failures['oauth_refresh_tokens.insert'];
+      codeOf(db).consumed_at = PAST_LEASE;
+      const retry = await postCode(app);
+
+      expect(retry.status).to.equal(400);
+      expect(retry.body.error).to.equal('invalid_grant');
+      expect(grantOf(db).status).to.equal('revoked');
+    });
+
+    it('releases only its own consume, never a value another request wrote', async () => {
+      // Another request takes the consume over while our insert fails.
+      const takenOver = secondsAgo(1);
+      const db = makeDb({ codes: [codeRow()], grants: [grantRow()] });
+      db.failures['oauth_refresh_tokens.insert'] = () => {
+        codeOf(db).consumed_at = takenOver;
+        return { code: '08006' };
+      };
+
+      expect((await postCode(buildApp(db))).status).to.equal(503);
+      expect(codeOf(db).consumed_at).to.equal(takenOver);
+    });
+
+    it('never takes over a stranded consume for an unauthentic presentation', async () => {
+      const db = makeDb({ codes: [codeRow({ consumed_at: PAST_LEASE })], grants: [grantRow()] });
+
+      const response = await postCode(buildApp(db), {
+        code_verifier: 'AnotherVerifierLongEnoughForRfc7636-abcdefghijklmn',
+      });
+
+      expect(response.status).to.equal(400);
+      expect(codeOf(db).consumed_at).to.equal(PAST_LEASE);
+      expect(grantOf(db).status).to.equal('active');
+      expect(db.tables.oauth_refresh_tokens).to.have.lengthOf(0);
+    });
+
+    it('refuses without revoking when another request wins the takeover', async () => {
+      const db = makeDb({ codes: [codeRow({ consumed_at: PAST_LEASE })], grants: [grantRow()] });
+      db.failures['oauth_authorization_codes.update'] = ({ filters }) => {
+        if (filters.some(([op, column]) => op === 'eq' && column === 'consumed_at')) {
+          codeOf(db).consumed_at = new Date().toISOString();
+        }
+        return null;
+      };
+
+      const response = await postCode(buildApp(db));
+
+      expect(response.status).to.equal(400);
+      expect(response.body.error).to.equal('invalid_grant');
+      expect(grantOf(db).status).to.equal('active');
+      expect(db.tables.oauth_refresh_tokens).to.have.lengthOf(0);
+    });
+
+    it('answers 503 when the root probe fails, and neither takes over nor issues', async () => {
+      // Reading a failed probe as "no root" would, past the lease, take over and
+      // issue a second set of tokens for a code that may already have issued.
+      const db = makeDb({ codes: [codeRow({ consumed_at: PAST_LEASE })], grants: [grantRow()] });
+      db.failures['oauth_refresh_tokens.select'] = ({ filters }) =>
+        filters.some(([, column]) => column === 'family_id') ? { code: '08006' } : null;
+
+      const response = await postCode(buildApp(db));
+
+      expect(response.status).to.equal(503);
+      expect(grantOf(db).status).to.equal('active');
+      expect(codeOf(db).consumed_at, 'no takeover').to.equal(PAST_LEASE);
+      expect(db.calls.insertAttempts).to.have.lengthOf(0);
+    });
+
+    it('refuses an expired stranded code without revoking', async () => {
+      const db = makeDb({
+        codes: [codeRow({ consumed_at: PAST_LEASE, expires_at: secondsFromNow(-1) })],
+        grants: [grantRow()],
+      });
+
+      const response = await postCode(buildApp(db));
+
+      expect(response.status).to.equal(400);
+      expect(grantOf(db).status).to.equal('active');
+    });
+
+    ['not-a-date', null].forEach((expiresAt) => {
+      it(`refuses a code whose expiry is ${JSON.stringify(expiresAt)}`, async () => {
+        // Fail closed: new Date('not-a-date') is NaN, and NaN <= now is false.
+        const db = makeDb({ codes: [codeRow({ expires_at: expiresAt })], grants: [grantRow()] });
+
+        const response = await postCode(buildApp(db));
+
+        expect(response.status).to.equal(400);
+        expect(response.body.error).to.equal('invalid_grant');
+        expect(codeOf(db).consumed_at == null).to.equal(true);
+      });
+    });
+
+    it('opens the refresh family derived from the code', async () => {
+      const db = makeDb({ codes: [codeRow()], grants: [grantRow()] });
+      await postCode(buildApp(db));
+
+      const [root] = db.tables.oauth_refresh_tokens;
+      expect(root.family_id).to.equal(codeFamilyId(sha256Hex(RAW_CODE)));
+      expect(root.family_id).to.match(
+        /^[0-9a-f]{8}-[0-9a-f]{4}-8[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/
+      );
     });
   });
 });

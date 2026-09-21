@@ -14,6 +14,7 @@ const request = require('supertest');
 
 const { createOauthRouter } = require('../routes/oauth');
 const mcpAccessTokenVerifier = require('../services/oauth/mcpAccessTokenVerifier');
+const refreshTokenStore = require('../services/oauth/refreshTokenStore');
 const { makeDb } = require('./helpers/oauthGrantTablesDouble');
 
 /**
@@ -623,6 +624,151 @@ describe('POST /api/oauth/token — rotating refresh_token (ticket 39b)', () => 
 
       expect(retry.status, JSON.stringify(retry.body)).to.equal(200);
       expect(retry.body.refresh_token).to.be.a('string');
+    });
+  });
+
+  // Mutation-proven, one at a time, each red in this file: child-found branch removed;
+  // lease removed; used_at alone treated as reuse again; takeover CAS made
+  // unconditional, or its replaced_by_id/revoked_at guard dropped; claim
+  // release made unconditional; revoked_at alone no longer reuse; child-probe
+  // failure read as "no child".
+  describe('a stranded claim is recovered, not read as theft (ticket 88)', () => {
+    const PAST_LEASE = new Date(Date.now() - refreshTokenStore.RETRY_LEASE_MS - 5000).toISOString();
+    const grantOf = (db) => db.tables.mcp_client_grants[0];
+
+    // Fails only the compensating release (used_at back to NULL).
+    const failClaimRelease = ({ patch }) =>
+      patch && patch.used_at === null ? { code: '08006' } : null;
+
+    it('recovers when the insert AND the release fail: 503 inside the lease, 200 after', async () => {
+      const { db, app, tokens } = await freshFamily(1);
+      db.failures['oauth_refresh_tokens.insert'] = { code: '08006' };
+      db.failures['oauth_refresh_tokens.update'] = failClaimRelease;
+
+      expect((await presentRefresh(app, tokens[0])).status).to.equal(503);
+      const root = db.tables.oauth_refresh_tokens[0];
+      expect(root.used_at, 'the release failed, so the claim is stranded').to.be.a('string');
+      delete db.failures['oauth_refresh_tokens.insert'];
+      delete db.failures['oauth_refresh_tokens.update'];
+
+      const inFlight = await presentRefresh(app, tokens[0]);
+      expect(inFlight.status, 'inside the lease a rotation may be in flight').to.equal(503);
+      expect(grantOf(db).status).to.equal('active');
+
+      root.used_at = PAST_LEASE;
+      const retry = await presentRefresh(app, tokens[0]);
+
+      expect(retry.status, JSON.stringify(retry.body)).to.equal(200);
+      expect(grantOf(db).status).to.equal('active');
+      expect(db.tables.oauth_refresh_tokens).to.have.lengthOf(2);
+      expect(root.replaced_by_id).to.equal(db.tables.oauth_refresh_tokens[1].id);
+    });
+
+    [
+      ['inside the lease', () => new Date().toISOString()],
+      ['past the lease', () => PAST_LEASE],
+    ].forEach(([label, usedAt]) => {
+      it(`still revokes a genuine reuse ${label}: used, unlinked, but a child exists`, async () => {
+        // The link failed after the child landed. The child probe is the proof:
+        // it must revoke at once (not 503 in flight), link the child, and never
+        // reach a second-child insert that UNIQUE(parent_id) would catch later.
+        const { db, app, tokens } = await freshFamily(2);
+        const [root, child] = db.tables.oauth_refresh_tokens;
+        root.replaced_by_id = null;
+        root.used_at = usedAt();
+        const insertsBefore = db.calls.insertAttempts.length;
+
+        const response = await presentRefresh(app, tokens[0]);
+
+        expect(response.status).to.equal(400);
+        expect(response.body.error).to.equal('invalid_grant');
+        expect(grantOf(db).status).to.equal('revoked');
+        expect(root.replaced_by_id).to.equal(child.id);
+        expect(db.calls.insertAttempts.length).to.equal(insertsBefore);
+      });
+    });
+
+    it('revokes when another presentation wins the takeover', async () => {
+      const { db, app, tokens } = await freshFamily(1);
+      const root = db.tables.oauth_refresh_tokens[0];
+      root.used_at = PAST_LEASE;
+      db.failures['oauth_refresh_tokens.update'] = ({ filters }) => {
+        if (filters.some(([op, column]) => op === 'eq' && column === 'used_at')) {
+          root.used_at = new Date().toISOString();
+        }
+        return null;
+      };
+
+      const response = await presentRefresh(app, tokens[0]);
+
+      expect(response.status).to.equal(400);
+      expect(response.body.error).to.equal('invalid_grant');
+      expect(grantOf(db).status).to.equal('revoked');
+    });
+
+    it('answers 503 when the child probe fails, and neither takes over nor inserts', async () => {
+      const { db, app, tokens } = await freshFamily(1);
+      const root = db.tables.oauth_refresh_tokens[0];
+      root.used_at = PAST_LEASE;
+      const insertsBefore = db.calls.insertAttempts.length;
+      db.failures['oauth_refresh_tokens.select'] = ({ filters }) =>
+        filters.some(([, column]) => column === 'parent_id') ? { code: '08006' } : null;
+
+      const response = await presentRefresh(app, tokens[0]);
+
+      expect(response.status).to.equal(503);
+      expect(grantOf(db).status).to.equal('active');
+      expect(root.used_at, 'no takeover').to.equal(PAST_LEASE);
+      expect(db.calls.insertAttempts.length).to.equal(insertsBefore);
+    });
+
+    it('does not take over a claim that was replaced between the read and the CAS', async () => {
+      // The takeover CAS also requires replaced_by_id and revoked_at to be NULL:
+      // a rotation that completed meanwhile is reuse, not a stranded claim.
+      const { db, app, tokens } = await freshFamily(1);
+      const root = db.tables.oauth_refresh_tokens[0];
+      root.used_at = PAST_LEASE;
+      const insertsBefore = db.calls.insertAttempts.length;
+      db.failures['oauth_refresh_tokens.update'] = ({ filters }) => {
+        if (filters.some(([op, column]) => op === 'eq' && column === 'used_at')) {
+          root.replaced_by_id = 999999;
+        }
+        return null;
+      };
+
+      const response = await presentRefresh(app, tokens[0]);
+
+      expect(response.status).to.equal(400);
+      expect(grantOf(db).status).to.equal('revoked');
+      expect(root.used_at, 'the CAS must not have landed').to.equal(PAST_LEASE);
+      expect(db.calls.insertAttempts.length).to.equal(insertsBefore);
+    });
+
+    it('refuses an expired stranded token without revoking', async () => {
+      const { db, app, tokens } = await freshFamily(1);
+      const root = db.tables.oauth_refresh_tokens[0];
+      root.used_at = PAST_LEASE;
+      root.expires_at = secondsFromNow(-1);
+
+      const response = await presentRefresh(app, tokens[0]);
+
+      expect(response.status).to.equal(400);
+      expect(grantOf(db).status).to.equal('active');
+    });
+
+    it('releases only its own claim, never a value another request wrote', async () => {
+      const { db } = await freshFamily(1);
+      const root = db.tables.oauth_refresh_tokens[0];
+      root.used_at = new Date().toISOString();
+
+      const released = await refreshTokenStore.releaseClaimIfNoChild(
+        root.id,
+        { supabase: db },
+        PAST_LEASE
+      );
+
+      expect(released.ok).to.equal(true);
+      expect(root.used_at, 'someone else holds this claim').to.not.equal(null);
     });
   });
 
