@@ -135,6 +135,8 @@ app.use(helmet({
 // Ticket 45: MCP service bucket — unconditional, above global limiter + 50mb
 // parsers. Do not move into routes/oauth.js (see oauthRateLimiters.MCP_SERVICE_PATHS).
 app.use(oauthRateLimiters.MCP_SERVICE_PATHS, oauthRateLimiters.mcpServiceAddressLimiter);
+// Ticket 45: MCP data bucket — same rule, own store (see MCP_DATA_PATHS).
+app.use(oauthRateLimiters.MCP_DATA_PATHS, oauthRateLimiters.mcpDataAddressLimiter);
 
 const limiter = rateLimit({
   windowMs: 15 * 60 * 1000,
@@ -142,8 +144,8 @@ const limiter = rateLimit({
   standardHeaders: true,
   legacyHeaders: false,
   message: { status: 429, error: 'Too many requests, please try again later.' },
-  // Skip only with the mount above. Authorize stays under this bucket too.
-  skip: oauthRateLimiters.isMcpServicePath,
+  // Skip only with the mounts above. Authorize stays under this bucket too.
+  skip: oauthRateLimiters.skipGlobalLimiter,
 });
 app.use(limiter);
 

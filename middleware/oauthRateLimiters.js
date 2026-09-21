@@ -13,8 +13,12 @@ const safeMetadataFetch = require('../services/oauth/safeMetadataFetch');
  * controls client_id and would mint a fresh bucket per invent). Per address =
  * spray many victims; per hostname = many hosts → one victim.
  *
+ * MCP data routes share that egress: MCP_DATA_PATHS gets its own bucket, and
+ * skipGlobalLimiter skips both.
+ *
  * MemoryStore is per process (LEGACY #5): ceiling × instance count. Weakens,
- * does not remove. Mount rules for MCP_SERVICE_PATHS: see that constant.
+ * does not remove. Mount rules for MCP_SERVICE_PATHS and MCP_DATA_PATHS: see
+ * those constants.
  */
 
 // Aligns with middleware/rateLimiter.js signup style; << global.
@@ -32,6 +36,13 @@ const MAX_CLIENT_ID_LENGTH = 512;
 // Higher than global: live introspect per tool call + exchange, one egress IP.
 const MCP_SERVICE_WINDOW_MS = 15 * 60 * 1000;
 const MCP_SERVICE_MAX = 6000;
+
+// Separate bucket, same per-address ceiling as the service one. <= 3 data
+// requests per tool call (unbatched ingest `started` + completion, + at most 1
+// resource call); the MCP server caps audited calls at 250/15min (launch 200),
+// so <= 750 here: that MCP-side cap, not this bucket, is expected to bind.
+const MCP_DATA_WINDOW_MS = 15 * 60 * 1000;
+const MCP_DATA_MAX = 6000;
 
 const stores = [];
 
@@ -106,6 +117,12 @@ const createMcpServiceLimiter = ({
 /** Single instance server.js mounts — do not remount (halves the budget). */
 const mcpServiceAddressLimiter = createMcpServiceLimiter();
 
+/** Own store: sharing the service one would let data calls starve introspect/token. */
+const createMcpDataLimiter = ({ windowMs = MCP_DATA_WINDOW_MS, limit = MCP_DATA_MAX } = {}) =>
+  createMcpServiceLimiter({ windowMs, limit });
+
+const mcpDataAddressLimiter = createMcpDataLimiter();
+
 /**
  * The oauth router's mount path, and the ONE place it is written down.
  * MCP_SERVICE_PATHS and the global body-parser skip both derive from it.
@@ -133,9 +150,32 @@ const OAUTH_ROUTER_PREFIX = '/api/oauth';
  * Paths the global limiter skips. Limited only because server.js does
  * `app.use(MCP_SERVICE_PATHS, mcpServiceAddressLimiter)` unconditionally,
  * above the global limiter and the 50mb parsers — not in routes/oauth.js
- * (flag-off would leave skip with no replacement). Next: ticket 34 ingest.
+ * (flag-off would leave skip with no replacement). Ticket 34 ingest is in
+ * MCP_DATA_PATHS.
  */
 const MCP_SERVICE_PATHS = [`${OAUTH_ROUTER_PREFIX}/introspect`, `${OAUTH_ROUTER_PREFIX}/token`];
+
+/**
+ * MCP-only data routes. One egress IP carries every assistant user, so the
+ * global 1000/15min would cap the whole population. Same mount rule as
+ * MCP_SERVICE_PATHS: server.js, unconditional, above the global limiter and
+ * parsers. A path-only carve-out is safe because only the MCP server calls these
+ * (mcp_upstream credential only, contract §8.4).
+ *
+ * The global 50mb parsers skip these paths (isRouteParsedPath), so each route
+ * mounts its own small parser; ticket 34's ingest route MUST, or its bodies go
+ * unread. /api/mealplan/me joins with ticket 32. Never /api/fooddata/search:
+ * the web app calls it too.
+ */
+const MCP_DATA_PATHS = ['/api/meallog/me', '/api/security-events/mcp'];
+
+/**
+ * The meallog router's mount (routes/index.js). Its parser skip covers the WHOLE
+ * router: express also serves /api/meallog//me through '/me', a spelling the data
+ * bucket does not match, and a global parser reading it would set req._body and
+ * make the route's own small parser a no-op.
+ */
+const MEALLOG_ROUTER_PREFIX = '/api/meallog';
 
 /**
  * Express 4's router is case-INSENSITIVE unless `case sensitive routing` is
@@ -162,11 +202,39 @@ const isMcpServicePath = (req) => {
   return MCP_SERVICE_PATHS.some((candidate) => path === candidate);
 };
 
+/**
+ * Matches exactly what `app.use(MCP_DATA_PATHS, …)` matches (case-insensitive,
+ * the path or anything below it at a segment boundary), so a spelling is skipped
+ * iff it is bucketed. isMcpServicePath is exact and double-limits a trailing slash.
+ * Being a prefix, a route mounted BELOW a data path (e.g. /api/meallog/me/history)
+ * inherits the data bucket; add one only if it is MCP-only too.
+ */
+const isMcpDataPath = (req) => {
+  const path = normalisePath(req);
+  return MCP_DATA_PATHS.some((candidate) => path === candidate || path.startsWith(`${candidate}/`));
+};
+
+/**
+ * The global limiter's skip. Every clause must have a matching unconditional
+ * mount above the global limiter, or its paths go unlimited.
+ */
+const skipGlobalLimiter = (req) => isMcpServicePath(req) || isMcpDataPath(req);
+
 /** Whole router, not just the two service paths — see skipOauthRouter. */
 const isOauthRouterPath = (req) => {
   const path = normalisePath(req);
   return path === OAUTH_ROUTER_PREFIX || path.startsWith(`${OAUTH_ROUTER_PREFIX}/`);
 };
+
+/** See MEALLOG_ROUTER_PREFIX: whole router, like isOauthRouterPath. */
+const isMealLogRouterPath = (req) => {
+  const path = normalisePath(req);
+  return path === MEALLOG_ROUTER_PREFIX || path.startsWith(`${MEALLOG_ROUTER_PREFIX}/`);
+};
+
+/** Bodies only the route's own parser may read. Adding a data path covers it here too. */
+const isRouteParsedPath = (req) =>
+  isOauthRouterPath(req) || isMcpDataPath(req) || isMealLogRouterPath(req);
 
 /**
  * Ticket 45 — wraps a global body parser so it does NOT consume `/api/oauth`
@@ -184,12 +252,16 @@ const isOauthRouterPath = (req) => {
  * silently put the next `/api/oauth` route back on 50mb, because nothing would
  * fail when it was added.
  *
+ * Also skips the data paths and the meallog router (isRouteParsedPath): the data
+ * bucket admits 6000/15min per address, each otherwise read at 50mb. The name is
+ * kept because server.js and the PR #16 tests pin it.
+ *
  * Named function expression on purpose: express reports `fn.name` as the layer
  * name, so the composition suite can assert the wrapper is actually mounted.
  */
 const skipOauthRouter = (parser) =>
   function skipOauthRouter(req, res, next) {
-    if (isOauthRouterPath(req)) return next();
+    if (isRouteParsedPath(req)) return next();
     return parser(req, res, next);
   };
 
@@ -204,19 +276,29 @@ module.exports = {
   authorizeAddressLimiter,
   metadataFetchClientLimiter,
   mcpServiceAddressLimiter,
+  mcpDataAddressLimiter,
   isMcpServicePath,
+  isMcpDataPath,
+  skipGlobalLimiter,
   isOauthRouterPath,
+  isMealLogRouterPath,
+  isRouteParsedPath,
   skipOauthRouter,
   resetAllForTests,
   OAUTH_ROUTER_PREFIX,
   MCP_SERVICE_PATHS,
+  MCP_DATA_PATHS,
+  MEALLOG_ROUTER_PREFIX,
   AUTHORIZE_WINDOW_MS,
   AUTHORIZE_MAX,
   METADATA_FETCH_WINDOW_MS,
   METADATA_FETCH_MAX,
   MCP_SERVICE_WINDOW_MS,
   MCP_SERVICE_MAX,
+  MCP_DATA_WINDOW_MS,
+  MCP_DATA_MAX,
   MAX_CLIENT_ID_LENGTH,
   clientKey,
   createMcpServiceLimiter,
+  createMcpDataLimiter,
 };
