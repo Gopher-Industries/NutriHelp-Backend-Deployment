@@ -30,6 +30,31 @@ const isNonEmptyString = (value) => typeof value === 'string' && value.trim() !=
 
 const sha256Hex = (value) => crypto.createHash('sha256').update(value).digest('hex');
 
+const CODE_FAMILY_DOMAIN = 'nutrihelp.oauth.code-family:';
+
+/**
+ * The refresh family a code opens, derived from its code_hash (ticket 88), so
+ * "did THIS redemption's root land?" is an exact lookup; a time window would
+ * also match another code's redemption on the same upserted grant (mig 004).
+ * Internal only. UUID v8 (custom), so it can never collide with a random v4.
+ */
+const codeFamilyId = (codeHash) => {
+  const bytes = crypto
+    .createHash('sha256')
+    .update(CODE_FAMILY_DOMAIN + codeHash)
+    .digest();
+  bytes[6] = (bytes[6] & 0x0f) | 0x80;
+  bytes[8] = (bytes[8] & 0x3f) | 0x80;
+  const hex = bytes.subarray(0, 16).toString('hex');
+  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
+};
+
+/** Fail closed: missing or unparseable expires_at → expired (NaN <= now is false). */
+const isCodeExpired = (row) => {
+  const expiry = new Date(row.expires_at).getTime();
+  return !row.expires_at || Number.isNaN(expiry) || expiry <= Date.now();
+};
+
 /** S256: BASE64URL(SHA256(ASCII(code_verifier))), compared in constant time. */
 const pkceMatches = (codeVerifier, storedChallenge) => {
   if (!isNonEmptyString(storedChallenge)) return false;
@@ -79,16 +104,30 @@ const redeemAuthorizationCode = async (body, deps = {}) => {
 
   if (!codeRow) return refuse('invalid_grant', 'code_not_found');
 
+  const familyId = codeFamilyId(codeRow.code_hash);
+
   // RFC 6749 §4.1.2: authentic replay (client + redirect + PKCE) revokes what
   // the code issued. Unauthentic replay is noise — revoking on any replay is a
   // forced-disconnect primitive (codes leak via redirect URLs).
+  //
+  // Ticket 88: revoke only when this code's root exists (tokens WERE issued).
+  // No root: the consume was stranded by a failed redemption, and past the
+  // lease an authentic retry takes it over. Recovery runs only after the
+  // authentic check, which needs the same proof as a first redemption, so it
+  // opens nothing new; unauthentic replay writes nothing and never revokes.
+  let strandedConsumedAt = null;
   if (codeRow.consumed_at) {
     const authentic =
       codeRow.client_id === clientId &&
       codeRow.redirect_uri === redirectUri &&
       pkceMatches(codeVerifier, codeRow.code_challenge);
 
-    if (authentic) {
+    if (!authentic) return refuse('invalid_grant', 'code_replay_unauthentic');
+
+    const root = await store.findFamilyRoot(familyId, deps);
+    if (!root.ok) return unavailable(root.detail);
+
+    if (root.found) {
       const swept = await store.revokeGrantAndAllFamilies(
         codeRow.grant_id,
         store.CODE_REPLAY_REVOKE_REASON,
@@ -97,14 +136,17 @@ const redeemAuthorizationCode = async (body, deps = {}) => {
 
       // Failed revoke → 503, not invalid_grant (would claim security ran when it didn't).
       if (!swept.ok) return unavailable(swept.detail);
+      return refuse('invalid_grant', 'code_already_consumed');
     }
 
-    return refuse('invalid_grant', authentic ? 'code_already_consumed' : 'code_replay_unauthentic');
+    if (isCodeExpired(codeRow)) return refuse('invalid_grant', 'code_expired');
+    if (store.isWithinLease(codeRow.consumed_at)) {
+      return unavailable('code_redemption_in_flight');
+    }
+    strandedConsumedAt = codeRow.consumed_at;
   }
 
-  if (new Date(codeRow.expires_at).getTime() <= Date.now()) {
-    return refuse('invalid_grant', 'code_expired');
-  }
+  if (isCodeExpired(codeRow)) return refuse('invalid_grant', 'code_expired');
 
   if (codeRow.client_id !== clientId) return refuse('invalid_grant', 'code_client_mismatch');
   if (codeRow.redirect_uri !== redirectUri) {
@@ -143,32 +185,14 @@ const redeemAuthorizationCode = async (body, deps = {}) => {
     return refuse('invalid_grant', 'grant_code_binding_mismatch');
   }
 
-  // Consume before issuing. `is('consumed_at', null)` is the single-use lock.
-  let consumed;
-  try {
-    const { data, error } = await db
-      .from('oauth_authorization_codes')
-      .update({ consumed_at: new Date().toISOString() })
-      .eq('id', codeRow.id)
-      .is('consumed_at', null)
-      .select('id');
-
-    if (error) return unavailable('code_consume_failed');
-    consumed = data;
-  } catch (err) {
-    return unavailable('code_consume_failed');
-  }
-
-  if (!Array.isArray(consumed) || consumed.length !== 1) {
-    return refuse('invalid_grant', 'code_already_consumed');
-  }
-
   // Never widen: code scopes ∩ grant scopes.
   const granted = scopes.intersectScopes(
     scopes.parseScope(codeRow.scopes),
     scopes.parseScope(grant.scopes)
   );
 
+  // Mint before any DB write, as on refresh: a signing blip must not strand
+  // the consume.
   const minted = issuer.issueMcpAccessToken(
     {
       userId: codeRow.user_id,
@@ -182,16 +206,63 @@ const redeemAuthorizationCode = async (body, deps = {}) => {
 
   if (!minted.ok) return unavailable(minted.detail);
 
+  // Consume, or take over the stranded consume (CAS on its exact consumed_at).
+  // Zero rows: another request got there first. Refuse WITHOUT revoking,
+  // since nothing is proven issued (on refresh a lost CAS is reuse).
+  const consumedAt = new Date().toISOString();
+  let consumed;
+  try {
+    let query = db
+      .from('oauth_authorization_codes')
+      .update({ consumed_at: consumedAt })
+      .eq('id', codeRow.id);
+    query =
+      strandedConsumedAt === null
+        ? query.is('consumed_at', null)
+        : query.eq('consumed_at', strandedConsumedAt);
+    const { data, error } = await query.select('id');
+
+    if (error) return unavailable('code_consume_failed');
+    consumed = data;
+  } catch (err) {
+    return unavailable('code_consume_failed');
+  }
+
+  if (!Array.isArray(consumed) || consumed.length !== 1) {
+    return refuse('invalid_grant', 'code_already_consumed');
+  }
+
+  // Best effort: release only after proving this redemption's root did not
+  // land (a failed insert may have committed), and only while consumed_at is
+  // still the value THIS request wrote, never another request's takeover.
+  const failAfterConsume = async (detail) => {
+    const root = await store.findFamilyRoot(familyId, deps);
+    if (root.ok && !root.found) {
+      // { error } deliberately not read: 503 either way, and a failed release
+      // is recovered at retry time. The try only stops a throw escaping.
+      try {
+        await db
+          .from('oauth_authorization_codes')
+          .update({ consumed_at: null })
+          .eq('id', codeRow.id)
+          .eq('consumed_at', consumedAt);
+      } catch (err) {
+        // As above.
+      }
+    }
+    return unavailable(detail);
+  };
+
   // Re-consent (Backend Lead): mig 004 upserts the same grant, so sweep prior
   // families before inserting the new root — otherwise old refresh tokens stay live.
   // Fail closed: do not issue while old families survive.
   const sweptPrior = await store.revokePriorFamilies(codeRow.grant_id, deps);
-  if (!sweptPrior.ok) return unavailable(sweptPrior.detail);
+  if (!sweptPrior.ok) return failAfterConsume(sweptPrior.detail);
 
   const refresh = await store.insertRefreshToken(
     {
       grantId: codeRow.grant_id,
-      familyId: crypto.randomUUID(),
+      familyId,
       parentId: null,
       userId: codeRow.user_id,
       clientId: codeRow.client_id,
@@ -201,7 +272,7 @@ const redeemAuthorizationCode = async (body, deps = {}) => {
     deps
   );
 
-  if (!refresh.ok) return unavailable(refresh.detail);
+  if (!refresh.ok) return failAfterConsume(refresh.detail);
 
   return {
     outcome: 'issued',
@@ -212,4 +283,4 @@ const redeemAuthorizationCode = async (body, deps = {}) => {
   };
 };
 
-module.exports = { redeemAuthorizationCode, CODE_VERIFIER_PATTERN };
+module.exports = { redeemAuthorizationCode, codeFamilyId, CODE_VERIFIER_PATTERN };
