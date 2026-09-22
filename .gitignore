@@ -11,7 +11,6 @@ server.pid
 server.log
 *.bak
 node_modules
-.claude/
 
 # TLS certificates and private keys — generate locally, never commit
 *.pem
@@ -19,7 +18,3 @@ node_modules
 *.crt
 *.p12
 certs/
-
-
-CLAUDE.md
-/docs
