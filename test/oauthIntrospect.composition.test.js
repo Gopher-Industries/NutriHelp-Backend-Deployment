@@ -256,7 +256,8 @@ describe('activation flag — the endpoint is dark unless explicitly enabled (ti
         else process.env.OAUTH_ROUTES_ENABLED = v;
         const app = express();
         register(app);
-        return app._router.stack.some((l) => l.regexp && /oauth/i.test(l.regexp.source));
+        const has = (re) => app._router.stack.some((l) => l.regexp && re.test(l.regexp.source));
+        return [has(/oauth/i), has(/consent/i)];
       };
       const values = [null, 'false', '1', 'TRUE', 'yes', '', 'true'];
       process.stdout.write('__RESULT__' + JSON.stringify(values.map((v) => [v, check(v)])));
@@ -285,8 +286,10 @@ describe('activation flag — the endpoint is dark unless explicitly enabled (ti
     return cached;
   };
 
-  it('does not mount the OAuth routes when the flag is unset', () => {
-    expect(mounted().get(null)).to.equal(false);
+  // Each value maps to [oauth mounted, consent mounted]. Consent approves
+  // transactions only /authorize creates, so it is part of the same dark flow.
+  it('does not mount the OAuth or consent routes when the flag is unset', () => {
+    expect(mounted().get(null)).to.deep.equal([false, false]);
   });
 
   it('does not mount them for any value other than the exact string "true"', () => {
@@ -294,12 +297,12 @@ describe('activation flag — the endpoint is dark unless explicitly enabled (ti
     // gate tests for the enabling value rather than for the absence of a
     // disabling one. 'false', '1', 'TRUE' and 'yes' all mean off.
     for (const value of ['false', '1', 'TRUE', 'yes', '']) {
-      expect(mounted().get(value), `value ${JSON.stringify(value)}`).to.equal(false);
+      expect(mounted().get(value), `value ${JSON.stringify(value)}`).to.deep.equal([false, false]);
     }
   });
 
   it('mounts them when the flag is exactly "true"', () => {
-    expect(mounted().get('true')).to.equal(true);
+    expect(mounted().get('true')).to.deep.equal([true, true]);
   });
 });
 

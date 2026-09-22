@@ -73,6 +73,7 @@ const purgeExpiredJtis = async (db, random = Math.random) => {
       .from('oauth_client_assertion_jti')
       .delete()
       .lt('expires_at', new Date().toISOString())
+      // Required by PostgREST 12 whenever limit is applied to a DELETE.
       .order('expires_at', { ascending: true })
       .limit(JTI_PURGE_BATCH_SIZE);
 

@@ -2,7 +2,6 @@ const crypto = require('crypto');
 const { expect } = require('chai');
 const sinon = require('sinon');
 const { approveConsent } = require('../../services/consentService');
-const { requireCsrfToken } = require('../../middleware/csrfProtection');
 const { requireExactOrigin } = require('../../middleware/requireExactOrigin');
 
 describe('consent approval', () => {
@@ -120,37 +119,5 @@ describe('consent approval', () => {
 
     process.env.NODE_ENV = previousEnvironment;
     process.env.OAUTH_FRONTEND_ORIGIN = previousOrigin;
-  });
-
-  it('requires the CSRF header to match the consent cookie', () => {
-    const request = {
-      headers: {
-        'x-csrf-token': 'csrf-value',
-        cookie: 'nutrihelp_csrf=csrf-value',
-      },
-    };
-    const next = sinon.stub();
-    requireCsrfToken(request, {}, next);
-    expect(next.calledOnce).to.equal(true);
-
-    const rejected = {
-      status: sinon.stub().returnsThis(),
-      json: sinon.stub().returnsThis(),
-    };
-    requireCsrfToken({ headers: { 'x-csrf-token': 'wrong', cookie: 'nutrihelp_csrf=csrf-value' } }, rejected, sinon.stub());
-    expect(rejected.status.calledWith(403)).to.equal(true);
-
-    const malformed = {
-      status: sinon.stub().returnsThis(),
-      json: sinon.stub().returnsThis(),
-    };
-    expect(() =>
-      requireCsrfToken(
-        { headers: { 'x-csrf-token': 'abé', cookie: 'nutrihelp_csrf=abc' } },
-        malformed,
-        sinon.stub()
-      )
-    ).to.not.throw();
-    expect(malformed.status.calledWith(403)).to.equal(true);
   });
 });

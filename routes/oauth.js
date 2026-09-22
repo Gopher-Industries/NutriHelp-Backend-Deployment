@@ -9,7 +9,15 @@ const { requireExactOrigin } = require('../middleware/requireExactOrigin');
 const defaultOauthRateLimiters = require('../middleware/oauthRateLimiters');
 
 /**
- * OAuth authorization-server routes. Middleware per route — never router-wide.
+ * OAuth authorization-server routes.
+ *
+ * Middleware per route — never router-wide:
+ *   GET  /authorize         anonymous; two rate buckets, no auth of any kind
+ *   POST /introspect        private_key_jwt; no Origin
+ *   POST /token             client auth is grant-specific: token-exchange needs
+ *                           private_key_jwt; authorization_code and refresh_token
+ *                           are public-client grants (PKCE + bindings, no client auth)
+ *   DELETE /grants/:grantId platform Bearer + exact Origin
  *
  * No trailing-slash redirect: MCP uses redirect:'error', so any 3xx hard-fails.
  *
@@ -46,20 +54,25 @@ const createOauthRouter = (deps = {}) => {
     introspectHandler
   );
 
-  // RFC 8693 exchange; grant_type dispatch is in the controller.
+  // All three grants; grant_type dispatch and per-grant client auth are in the controller.
   const tokenController = deps.oauthTokenController || oauthTokenController;
   const tokenHandler = tokenController.createTokenController(deps);
 
   router.post('/token', express.urlencoded({ extended: false, limit: '16kb' }), tokenHandler);
 
-  // Ticket 43 disconnect. Auth then Origin (Origin after Bearer so anonymous
-  // callers learn nothing about configured origins). Path param is the opaque
-  // grant uuid only — never a CIMD client URL.
+  // Disconnect (revoke one grant). Auth then Origin (Origin after Bearer so
+  // anonymous callers learn nothing about configured origins).
   //
-  // Contract wants Bearer + Origin + action-bound CSRF (issuer = ticket 79).
-  // authenticateToken is Bearer-only, so a forged DELETE dies at 401. Gap
-  // accepted until that issuer exists. OAUTH_ROUTES_ENABLED mounts this whole
-  // router, so enabling MCP also goes this DELETE live — it is not dark.
+  // Path param is the opaque grant uuid only — never a CIMD client URL: a URL
+  // needs percent-encoding and contains slashes, so as a path segment it can
+  // decode differently or match the wrong route.
+  //
+  // Contract wants Bearer + Origin + action-bound CSRF (a token minted by a
+  // GET /api/oauth/grants issuer that does not exist yet). CSRF here means
+  // single-use intent binding, not cross-site forgery: authenticateToken is
+  // Bearer-only, so a forged DELETE arrives with no credential and dies at 401.
+  // Gap accepted until that issuer exists. OAUTH_ROUTES_ENABLED mounts this
+  // whole router, so enabling MCP also goes this DELETE live — it is not dark.
   const authenticate = deps.authenticateToken || authenticateToken;
   const originGuard = (deps.requireExactOrigin || requireExactOrigin)(deps);
   const disconnectHandler = (

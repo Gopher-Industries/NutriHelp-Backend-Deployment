@@ -257,6 +257,8 @@ docker compose exec api python -c "import numpy, pandas, seaborn, sklearn, matpl
 
 ### Validate the test suite in Docker
 
+This runs the full jest suite, which writes to whatever database the container's `.env` points at. Read the warning under [Automated Testing](#automated-testing) first.
+
 ```bash
 docker compose exec api npm test
 ```
@@ -306,9 +308,29 @@ When the server is running, open:
 
 ## Automated Testing
 
-The current repository uses `mocha` for automated tests.
+The repository uses both `jest` (`npm test`) and `mocha` (`npm run test:unit`, `npm run test:oauth`).
 
-Run the full suite:
+Safe suites. These set placeholder Supabase credentials themselves and never touch a real database:
+
+```bash
+npm run test:oauth     # OAuth endpoint suites, test/oauth*.test.js (mocha)
+npm run test:meallog   # meal-log route + in-memory SQL integration
+```
+
+The consent tests are not in the `test:oauth` glob. Run `test/consent.route.test.js` and
+`test/unit/consentApproval.test.js` in separate mocha processes: in one process, `sinon.restore()` in
+the second file undoes a stub the first file sets up when it loads.
+
+> ⚠️ **`npm test` writes to the live, shared database.** Several jest files write through whatever
+> Supabase project `.env` names: for example `test/appointment.v2.test.js` creates appointments, and
+> `test/userPreferencesExtended.test.js` (via `test/test-helpers.js`) inserts rows into the real
+> `users` table. Some of those files load `server.js`, which runs `dotenv.config({ override: true })`
+> and so replaces whatever you exported with the values in `.env`. That is why setting the variables in
+> your shell is not enough. Run it only with a `.env` that holds dummy credentials (for example
+> `SUPABASE_URL=https://test.supabase.co`, `SUPABASE_ANON_KEY=dummy`, `SUPABASE_SERVICE_ROLE_KEY=dummy`).
+> Expect many pre-existing failures when it runs against dummy credentials.
+
+Run the full suite (see the warning above):
 
 ```bash
 npm test
