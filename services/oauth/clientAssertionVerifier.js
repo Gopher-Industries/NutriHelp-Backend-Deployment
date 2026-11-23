@@ -247,6 +247,10 @@ const verifyClientAssertion = async (params = {}, deps = {}) => {
     return fail(401, 'invalid_client', 'assertion_audience_not_sole');
   }
 
+  if (deps.requireBodyDigest && (typeof verifiedPayload.body_sha256 !== 'string' ||
+      !/^[0-9a-f]{64}$/.test(verifiedPayload.body_sha256))) {
+    return fail(401, 'invalid_client', 'body_digest_missing');
+  }
   const { iat, exp, jti } = verifiedPayload;
 
   // Number.isFinite: NaN/±Infinity are typeof number; Infinity breaks Date#toISOString.
@@ -290,7 +294,9 @@ const verifyClientAssertion = async (params = {}, deps = {}) => {
 
   const purge = await purgeExpiredJtis(db, random);
 
-  return { ok: true, clientId: claimedClientId, purge };
+  return { ok: true, clientId: claimedClientId, purge,
+    ...(deps.requireBodyDigest ? { bodyDigest: verifiedPayload.body_sha256 } : {}),
+  };
 };
 
 module.exports = {

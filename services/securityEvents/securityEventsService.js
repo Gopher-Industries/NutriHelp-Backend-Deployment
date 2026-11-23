@@ -22,6 +22,7 @@ async function getSecurityEvents(fromDate, toDate) {
     { data: auditLogs, error: auditError },
     { data: errorLogs, error: appError },
     { data: rbacLogs, error: rbacError },
+    { data: mcpLogs, error: mcpError },
   ] = await Promise.all([
     supabase.from('auth_logs').select('*').gte('created_at', fromIso).lte('created_at', toIso),
     supabase.from('brute_force_logs').select('*').gte('created_at', fromIso).lte('created_at', toIso),
@@ -29,6 +30,9 @@ async function getSecurityEvents(fromDate, toDate) {
     supabase.from('audit_logs').select('*').gte('created_at', fromIso).lte('created_at', toIso),
     supabase.from('error_logs').select('*').gte('created_at', fromIso).lte('created_at', toIso),
     supabase.from('rbac_violation_logs').select('*').gte('created_at', fromIso).lte('created_at', toIso),
+    process.env.OAUTH_ROUTES_ENABLED === 'true' && process.env.MCP_AUDIT_INGEST_URL
+      ? supabase.from('mcp_audit_events').select('event_id,phase,envelope,received_at').gte('received_at', fromIso).lte('received_at', toIso)
+      : { data: [] },
   ]);
 
   // ===== 1) Login events from public.auth_logs =====
@@ -269,6 +273,19 @@ async function getSecurityEvents(fromDate, toDate) {
           status: log.status,
         },
       });
+    });
+  }
+  if (mcpError) throw new Error('MCP audit events unavailable');
+  for (const row of mcpLogs || []) {
+    const { tool, outcome, correlation_id, user_id } = row.envelope;
+    events.push({
+      ...SecurityEvent,
+      id: `mcp_${row.event_id}_${row.phase}`,
+      occurredAt: row.received_at,
+      type: 'MCP_TOOL_CALL', severity: outcome === 'failure' ? 'MEDIUM' : 'LOW',
+      actor: { userId: user_id }, correlationId: correlation_id,
+      source: { system: 'supabase', table: 'public.mcp_audit_events', recordId: row.event_id },
+      metadata: { tool, phase: row.phase, outcome: outcome || null },
     });
   }
   // ===== sort by occurredAt (do this ONCE) =====
