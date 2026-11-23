@@ -28,6 +28,7 @@ module.exports = app => {
     // /api/consent is part of the OAuth flow (it approves transactions that
     // only /api/oauth/authorize creates), so it is dark behind the same flag.
     if (process.env.OAUTH_ROUTES_ENABLED === 'true') {
+        app.use('/api/security-events/mcp', require('./mcpAudit')());
         app.use('/api/consent', require('./consent'));
         app.use('/api/oauth', require('./oauth'));
     }

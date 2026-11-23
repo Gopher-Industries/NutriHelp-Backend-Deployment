@@ -41,6 +41,7 @@ const mcpResourceIdentifier = () => readEnv('MCP_RESOURCE_IDENTIFIER');
 const frontendOrigin = () => readEnv('OAUTH_FRONTEND_ORIGIN');
 
 module.exports = {
+  auditIngestAudience: () => absoluteEndpointUrl('MCP_AUDIT_INGEST_URL'),
   introspectionAudience,
   tokenEndpointAudience,
   backendApiAudience,

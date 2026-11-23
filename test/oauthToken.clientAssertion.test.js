@@ -121,6 +121,21 @@ const verifyAtTokenEndpoint = (assertion, { db = makeDb(), config = {} } = {}) =
     random: () => 0.99,
   });
 
+describe('MCP audit assertion body binding', () => {
+  it('returns the signed digest only for a valid ingest assertion', async () => {
+    const hash = crypto.createHash('sha256').update('synthetic audit batch').digest('hex');
+    const verify = claims => clientAssertionVerifier.verifyClientAssertion(request(signAssertion(claims)), {
+      supabase: makeDb(), assertionAudience: { resolve: () => INGEST_URL },
+      requireBodyDigest: true, random: () => 0.99,
+    });
+    const valid = await verify({ aud: INGEST_URL, body_sha256: hash });
+    expect(valid.ok).to.equal(true);
+    expect(valid.bodyDigest).to.equal(hash);
+    expect((await verify({ aud: INGEST_URL })).ok).to.equal(false);
+    expect((await verify({ aud: TOKEN_URL, body_sha256: hash })).ok).to.equal(false);
+  });
+});
+
 describe('oauth token endpoint - client assertion audience (Q16a)', () => {
   describe('oauthConfig.tokenEndpointAudience', () => {
     const TOUCHED = ['MCP_TOKEN_ENDPOINT_URL', 'MCP_INTROSPECTION_URL'];
