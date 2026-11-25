@@ -36,10 +36,10 @@ async function signup(req, res) {
         return res.status(400).json(toValidationError('password', error.message));
       }
 
-      return res.status(error.statusCode).json({ success: false, error: error.message });
+      return res.status(error.statusCode).json({ success: false, error: error.message, ...(code && { code }) });
     }
 
-    console.error('Signup error:', error);
+    console.error('Could not complete signup', error?.code || 'STORAGE_ERROR');
     return res.status(500).json({ success: false, error: 'Internal server error' });
   }
 }
