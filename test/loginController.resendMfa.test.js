@@ -22,7 +22,7 @@ describe("loginController resendMfa", () => {
   let addMfaToken;
   let invalidateMfaTokens;
   let validationResultStub;
-  let transporter;
+  let sendMfaEmail;
   let controller;
 
   beforeEach(() => {
@@ -33,7 +33,7 @@ describe("loginController resendMfa", () => {
       isEmpty: () => true,
       array: () => [],
     });
-    transporter = { sendMail: sinon.stub().resolves() };
+    sendMfaEmail = sinon.stub().resolves();
 
     controller = proxyquire("../controller/loginController", {
       "../model/getUserCredentials.js": getUserCredentials,
@@ -43,9 +43,7 @@ describe("loginController resendMfa", () => {
         verifyMfaToken: sinon.stub(),
       },
       "express-validator": { validationResult: validationResultStub },
-      nodemailer: {
-        createTransport: sinon.stub().returns(transporter),
-      },
+      "../utils/emailService": { sendMfaEmail },
       "../Monitor_&_Logging/loginLogger": sinon.stub().resolves(),
       "../dbConnection": {},
     });
@@ -73,6 +71,7 @@ describe("loginController resendMfa", () => {
     expect(res.body.success).to.equal(true);
     expect(invalidateMfaTokens.calledWith(77)).to.equal(true);
     expect(addMfaToken.calledOnce).to.equal(true);
+    expect(sendMfaEmail.calledOnceWith("mfa@example.com", addMfaToken.firstCall.args[1])).to.equal(true);
   });
 
   it("rejects resend requests for accounts without MFA enabled", async () => {

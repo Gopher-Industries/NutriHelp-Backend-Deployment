@@ -8,11 +8,12 @@ async function addMfaToken(userId, token) {
     // Ensure userId is stored as integer
     const parsedUserId = parseInt(userId, 10);
 
-    await supabase
+    const { error: invalidateError } = await supabase
       .from('mfatokens')
       .update({ is_used: true })
       .eq('user_id', parsedUserId)
       .eq('is_used', false);
+    if (invalidateError) throw invalidateError;
 
     const { data, error } = await supabase
       .from('mfatokens')
@@ -67,7 +68,6 @@ async function verifyMfaToken(userId, token) {
 
     const mfaToken = data?.[0];
     if (!mfaToken) {
-      console.log("❌ No valid token found for user:", parsedUserId, "token:", token);
       return false;
     }
 
@@ -79,14 +79,15 @@ async function verifyMfaToken(userId, token) {
       return false;
     }
 
-    // Mark token as used
-    await supabase
+    const { data: consumed, error: consumeError } = await supabase
       .from('mfatokens')
       .update({ is_used: true })
-      .eq('id', mfaToken.id);
-
-    console.log("✅ Token validated successfully for user:", parsedUserId);
-    return true;
+      .eq('id', mfaToken.id)
+      .eq('is_used', false)
+      .gt('expiry', new Date().toISOString())
+      .select('id');
+    if (consumeError) throw consumeError;
+    return consumed?.length === 1;
   } catch (error) {
     console.error("Error verifying MFA token:", error);
     throw error;

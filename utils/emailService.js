@@ -90,6 +90,9 @@ async function sendEmail({ to, subject, html }) {
 }
 
 async function sendMfaEmail(to, token) {
+  if (REQUIRED_ENV.some(key => !process.env[key])) {
+    throw new Error('MFA email delivery is not configured');
+  }
   console.log('[emailService] Sending MFA email...');
   await sendEmail({
     to,

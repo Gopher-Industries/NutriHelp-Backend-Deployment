@@ -2,6 +2,8 @@ const bcrypt = require("bcryptjs");
 const jwt = require("jsonwebtoken");
 const logLoginEvent = require("../Monitor_&_Logging/loginLogger");
 const getUserCredentials = require("../model/getUserCredentials.js");
+const { recoverForLogin } = require("../services/signupService");
+const { isServiceError } = require("../services/serviceError");
 const {
   addMfaToken,
   invalidateMfaTokens,
@@ -91,7 +93,7 @@ const login = async (req, res) => {
       });
     }
 
-    const user = await getUserCredentials(email);
+    const user = await getUserCredentials(email) || await recoverForLogin(email, password);
 
     if (!user) {
       await supabase.from("brute_force_logs").insert([
@@ -258,6 +260,9 @@ const login = async (req, res) => {
     }
         return ok(res, { user: sanitizeUserForResponse(user), token });
   } catch (err) {
+    if (isServiceError(err)) {
+      return fail(res, err.message, err.statusCode, err.details?.code || "ACCOUNT_SETUP_UNAVAILABLE");
+    }
     log(
       createLog({
         event_type: "SYSTEM_ERROR",
@@ -303,9 +308,7 @@ const loginMfa = async (req, res) => {
     }
 
     const validPassword = await bcrypt.compare(password, user.password);
-    const validToken = await verifyMfaToken(user.user_id, mfa_token);
-
-    if (!validPassword || !validToken) {
+    if (!validPassword || !await verifyMfaToken(user.user_id, mfa_token)) {
       return fail(res, msg("auth.login.mfa_invalid"), 401, "AUTH_MFA_INVALID");
     }
 
